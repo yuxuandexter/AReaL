@@ -41,10 +41,6 @@ classifiers = [
 
 dependencies = [
     # Core ML/AI libraries
-    "torch==2.8.0",
-    "torchaudio",
-    "torchvision",
-
     "huggingface_hub",
     "datasets",
     "accelerate",
@@ -53,7 +49,6 @@ dependencies = [
     "mbridge==0.13.0",
     "flashinfer-python==0.3.1",
     "sglang[all]==0.5.2",
-    "flash-attn==2.8.3",
     "vllm==0.10.2",
     "peft",
     "qwen_agent",
@@ -88,7 +83,6 @@ dependencies = [
     "msgspec",
     "latex2sympy2",
     "openai==1.99.6",
-    "dotenv",
     "json5",
 
     # Monitoring and logging
