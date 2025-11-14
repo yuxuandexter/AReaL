@@ -229,7 +229,7 @@ filelock==3.20.0
     #   transformers
     #   virtualenv
     #   vllm
-flash-attn==2.8.3
+# flash-attn==2.8.3
     # via areal (pyproject.toml)
 flashinfer-python==0.3.1
     # via

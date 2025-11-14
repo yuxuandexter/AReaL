@@ -48,10 +48,8 @@ dependencies = [
     "megatron-core==0.13.1",
     "mbridge==0.13.0",
     "flashinfer-python==0.3.1",
-    "sglang[all]==0.5.2",
     "vllm==0.10.2",
     "peft",
-    "qwen_agent",
 
     # Scientific computing
     "scipy",
@@ -82,7 +80,7 @@ dependencies = [
     "pybase64",
     "msgspec",
     "latex2sympy2",
-    "openai==1.99.6",
+    "openai==1.99.1",
     "json5",
 
     # Monitoring and logging
@@ -161,9 +159,19 @@ docs = [
     "jupyter-book",
 ]
 
+chat = [
+    "qwen_agent",
+]
+
+inference = [
+    "sglang[all]==0.5.2",
+]
+
 all = [
     "areal[dev]",
     "areal[docs]",
+    "areal[chat]",
+    "areal[inference]",
 ]
 
 [project.urls]
@@ -182,7 +190,7 @@ exclude = ["tests*", "realhf*", "docs*", "examples*", "evaluation*", "benchmark*
 
 [tool.uv]
 override-dependencies=[
-    "openai==1.99.6",
+    "openai==1.99.1",
     "xgrammar==0.1.24",
     "outlines-core==0.1.26",
 ]

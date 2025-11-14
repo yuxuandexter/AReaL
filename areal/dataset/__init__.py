@@ -10,7 +10,14 @@ if TYPE_CHECKING:
     from transformers.processing_utils import ProcessorMixin
     from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 
-VALID_DATASETS = ["gsm8k", "clevr_count_70k", "geometry3k", "hh-rlhf", "torl_data"]
+VALID_DATASETS = [
+    "gsm8k",
+    "clevr_count_70k",
+    "geometry3k",
+    "hh-rlhf",
+    "torl_data",
+    "deepscaler",
+]
 
 logger = logging.getLogger("Dataset")
 
@@ -82,6 +89,26 @@ def _get_custom_dataset(
             path=path,
             split=split,
             processor=processor,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "deepscaler" in path.lower() and type == "sft":
+        from .deepscaler import get_deepscaler_sft_dataset
+
+        return get_deepscaler_sft_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "deepscaler" in path.lower() and type == "rl":
+        from .deepscaler import get_deepscaler_rl_dataset
+
+        return get_deepscaler_rl_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
             max_length=max_length,
             **kwargs,
         )
