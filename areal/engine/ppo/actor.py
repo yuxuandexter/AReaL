@@ -28,6 +28,7 @@ class PPOActor:
     def __init__(self, config: PPOActorConfig, engine: TrainEngine):
         self.config = config
         self.engine = engine
+        self.simulation_mode = getattr(config, "simulation_mode", False)
 
         self.reward_bias = config.reward_bias
         self.reward_scaling = config.reward_scaling
@@ -88,6 +89,10 @@ class PPOActor:
         )
 
     def compute_advantages(self, data: dict[str, Any]) -> None:
+        if self.simulation_mode:
+            self._simulate_advantages(data)
+            return
+
         bs = data["input_ids"].shape[0]
         max_seqlen = data["input_ids"].shape[1]
         batch_indices = torch.arange(
@@ -180,6 +185,19 @@ class PPOActor:
         data["loss_mask"] = loss_mask
         # because we have rolled old_logp by -1
         data["logprobs"] = old_logp
+
+    def _simulate_advantages(self, data: dict[str, Any]) -> None:
+        device = data["input_ids"].device
+        bs, max_seqlen = data["input_ids"].shape[:2]
+        dtype = data["logprobs"].dtype if "logprobs" in data else torch.float32
+        loss_mask = torch.roll(data["loss_mask"].float(), shifts=-1, dims=-1)
+        random_vals = torch.randn((bs, max_seqlen), device=device, dtype=dtype)
+        masked = random_vals * loss_mask
+        data["advantages"] = masked
+        data["kl_rewards"] = torch.zeros_like(masked)
+        data["tot_rewards"] = masked
+        data["returns"] = masked
+        data["loss_mask"] = loss_mask
 
     def ppo_update(self, data: dict[str, Any]) -> list[dict[str, float]]:
         if self.dynamic_sampling and len(data["rewards"]) % self.group_size == 0:

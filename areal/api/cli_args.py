@@ -666,6 +666,7 @@ class SGLangConfig:
     model_path: str = ""
     random_seed: int = 1
     skip_tokenizer_init: bool = False
+    reasoning_parser: str | None = None
     disable_cuda_graph: bool = False
     disable_radix_cache: bool = True
     disable_cuda_graph_padding: bool = False
@@ -1320,6 +1321,18 @@ class GRPOConfig(BaseExperimentConfig):
         default=True,
         metadata={
             "help": "Enable asynchronous training between rollout and policy update."
+        },
+    )
+    max_debug_steps: int | None = field(
+        default=30,
+        metadata={
+            "help": "Maximum number of training steps to run for debugging. None disables the cap."
+        },
+    )
+    simulation_mode: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable simulation mode for benchmarking/debugging purposes."
         },
     )
     gconfig: GenerationHyperparameters = field(
