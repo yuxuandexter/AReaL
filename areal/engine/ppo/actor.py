@@ -88,8 +88,13 @@ class PPOActor:
             aggregate_fn=lambda xs: torch.cat(xs, dim=-1),
         )
 
-    def compute_advantages(self, data: dict[str, Any]) -> None:
-        if self.simulation_mode:
+    def compute_advantages(
+        self, data: dict[str, Any], simulation_mode: bool | None = None
+    ) -> None:
+        if simulation_mode is None:
+            simulation_mode = self.simulation_mode
+
+        if simulation_mode:
             self._simulate_advantages(data)
             return
 
@@ -186,18 +191,132 @@ class PPOActor:
         # because we have rolled old_logp by -1
         data["logprobs"] = old_logp
 
+        # Log tensor profiles for debugging.
+        self._log_tensor_profile("advantages", advantages)
+        self._log_tensor_profile("kl_rewards", kl_rewards)
+        self._log_tensor_profile("tot_rewards", rewards)
+        self._log_tensor_profile("loss_mask", loss_mask)
+        self._log_tensor_profile("logprobs", old_logp)
+
     def _simulate_advantages(self, data: dict[str, Any]) -> None:
         device = data["input_ids"].device
-        bs, max_seqlen = data["input_ids"].shape[:2]
+        attn_mask = data["attention_mask"].float()
+        bs, max_seqlen = attn_mask.shape[:2]
         dtype = data["logprobs"].dtype if "logprobs" in data else torch.float32
+
+        # Align loss mask with the shifted convention used in real advantage computation.
         loss_mask = torch.roll(data["loss_mask"].float(), shifts=-1, dims=-1)
-        random_vals = torch.randn((bs, max_seqlen), device=device, dtype=dtype)
-        masked = random_vals * loss_mask
-        data["advantages"] = masked
-        data["kl_rewards"] = torch.zeros_like(masked)
-        data["tot_rewards"] = masked
-        data["returns"] = masked
+
+        seqlens = attn_mask.sum(-1).long()
+        batch_indices = torch.arange(bs, device=device, dtype=torch.long)
+        reward_positions = torch.clamp(seqlens - 2, min=0)
+
+        # Simulate per-sequence rewards within the configured reward clip range.
+        reward_scale = float(self.reward_clip or 1.5)
+        per_sequence_rewards = torch.empty(
+            bs, device=device, dtype=dtype
+        ).uniform_(-reward_scale, reward_scale)
+
+        tot_rewards = torch.zeros(bs, max_seqlen, device=device, dtype=dtype)
+        tot_rewards[batch_indices, reward_positions] = per_sequence_rewards
+        tot_rewards *= loss_mask
+
+        # Simulate KL rewards (kept zero as in most real trajectories).
+        kl_rewards = torch.zeros_like(tot_rewards)
+
+        if self.config.gae_mirror:
+            advantages, returns = self._simulate_advantages_mirror_gae(
+                tot_rewards, loss_mask
+            )
+        else:
+            advantages, returns = self._simulate_advantages_fast(
+                loss_mask=loss_mask,
+                reward_positions=reward_positions,
+                seqlens=seqlens,
+                per_sequence_rewards=per_sequence_rewards,
+                max_seqlen=max_seqlen,
+                reward_scale=reward_scale,
+                device=device,
+                dtype=dtype,
+            )
+
+        data["advantages"] = advantages
+        data["kl_rewards"] = kl_rewards
+        data["tot_rewards"] = tot_rewards
+        data["returns"] = returns
         data["loss_mask"] = loss_mask
+
+    def _simulate_advantages_fast(
+        self,
+        *,
+        loss_mask: torch.Tensor,
+        reward_positions: torch.Tensor,
+        seqlens: torch.Tensor,
+        per_sequence_rewards: torch.Tensor,
+        max_seqlen: int,
+        reward_scale: float,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        seq_positions = torch.arange(max_seqlen, device=device).unsqueeze(0)
+        reward_pos = reward_positions.unsqueeze(1)
+        deltas = torch.clamp(reward_pos - seq_positions, min=0)
+
+        window = torch.clamp(seqlens.unsqueeze(1).float(), min=1.0)
+        triangular = torch.clamp(window - deltas.float(), min=0.0) / window
+        triangular = triangular.to(dtype)
+        ramp = per_sequence_rewards.unsqueeze(1) * triangular
+
+        returns = ramp * loss_mask
+        noise_scale = 0.1 * reward_scale
+        if noise_scale > 0:
+            noise = torch.randn_like(ramp) * noise_scale
+        else:
+            noise = torch.zeros_like(ramp)
+        advantages = (ramp + noise) * loss_mask
+        return advantages, returns
+
+    def _simulate_advantages_mirror_gae(
+        self, tot_rewards: torch.Tensor, loss_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        bs, max_seqlen = tot_rewards.shape
+        dtype = tot_rewards.dtype
+        device = tot_rewards.device
+        advantages = torch.zeros_like(tot_rewards)
+        returns = torch.zeros_like(tot_rewards)
+        running_advantage = torch.zeros(bs, device=device, dtype=dtype)
+        for t in range(max_seqlen - 1, -1, -1):
+            delta = tot_rewards[:, t]
+            running_advantage = delta + self.discount * self.gae_lambda * running_advantage
+            advantages[:, t] = running_advantage
+            returns[:, t] = running_advantage
+
+        noise_std = 0.15
+        noise = torch.randn_like(advantages) * noise_std
+        advantages = (advantages + noise) * loss_mask
+        returns = returns * loss_mask
+        return advantages, returns
+
+    def _log_tensor_profile(self, name: str, tensor: torch.Tensor | None) -> None:
+        if tensor is None:
+            logger.info("Tensor stats [%s]: tensor is None", name)
+            return
+        if tensor.numel() == 0:
+            logger.info("Tensor stats [%s]: empty tensor", name)
+            return
+        detached = tensor.detach()
+        flattened = detached.float().reshape(-1)
+        zero_ratio = (flattened == 0).float().mean().item()
+        min_val = flattened.min().item()
+        max_val = flattened.max().item()
+        logger.info(
+            "Tensor stats [%s]: shape=%s min=%.6f max=%.6f zero_ratio=%.6f",
+            name,
+            tuple(detached.shape),
+            min_val,
+            max_val,
+            zero_ratio,
+        )
 
     def ppo_update(self, data: dict[str, Any]) -> list[dict[str, float]]:
         if self.dynamic_sampling and len(data["rewards"]) % self.group_size == 0:

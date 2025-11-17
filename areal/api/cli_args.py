@@ -474,6 +474,12 @@ class PPOActorConfig(TrainEngineConfig):
     gae_lambda: float = field(
         default=1.0, metadata={"help": "Lambda parameter for GAE"}
     )
+    gae_mirror: bool = field(
+        default=False,
+        metadata={
+            "help": "When simulating advantages, mirror the full GAE recursion instead of the fast synthetic ramp."
+        },
+    )
     adv_norm: NormConfig | None = field(
         default=None, metadata={"help": "Normalization configuration for advantages."}
     )
@@ -1333,6 +1339,12 @@ class GRPOConfig(BaseExperimentConfig):
         default=False,
         metadata={
             "help": "Enable simulation mode for benchmarking/debugging purposes."
+        },
+    )
+    reward_timeout_seconds: float = field(
+        default=1.0,
+        metadata={
+            "help": "Timeout in seconds for reward function execution before aborting."
         },
     )
     gconfig: GenerationHyperparameters = field(
