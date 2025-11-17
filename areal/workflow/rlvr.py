@@ -64,14 +64,39 @@ class RLVRWorkflow(RolloutWorkflow):
             self.data_extract_prompt_fn(data), self.tokenizer, self.enable_thinking
         )
 
+        # TODO: support llm generation with max_new_token_list
         n_samples = self.gconfig.n_samples
-        req = ModelRequest(
-            rid=uuid.uuid4().hex,
-            input_ids=input_ids,
-            gconfig=self.gconfig.new(n_samples=1),
-            tokenizer=self.tokenizer,
-        )
-        resps = await asyncio.gather(*[engine.agenerate(req) for _ in range(n_samples)])
+        should_simulate_response = self.gconfig.simulate_response
+        requests: list[ModelRequest] = []
+        expected_lengths: list[int | None] = []
+        if should_simulate_response:
+            max_new_token_list = data.get("max_new_token_list")
+            if max_new_token_list is None or len(max_new_token_list) == 0:
+                raise ValueError(
+                    "simulate_response=True requires a non-empty 'max_new_token_list' in the sample data."
+                )
+            for sample_idx in range(n_samples):
+                per_sample_max = int(max_new_token_list[sample_idx % len(max_new_token_list)])
+                req = ModelRequest(
+                    rid=uuid.uuid4().hex,
+                    input_ids=input_ids,
+                    gconfig=self.gconfig.new(
+                        n_samples=1, max_new_tokens=per_sample_max, ignore_eos=True
+                    ),
+                    tokenizer=self.tokenizer,
+                )
+                requests.append(req)
+                expected_lengths.append(per_sample_max)
+        else:
+            req = ModelRequest(
+                rid=uuid.uuid4().hex,
+                input_ids=input_ids,
+                gconfig=self.gconfig.new(n_samples=1),
+                tokenizer=self.tokenizer,
+            )
+            requests.append(req)
+            expected_lengths.append(None)
+        resps = await asyncio.gather(*[engine.agenerate(req) for req in requests])
 
         version = engine.get_version()
         prompt_strs = []
@@ -80,7 +105,26 @@ class RLVRWorkflow(RolloutWorkflow):
         seqlens = []
 
         results = []
-        for resp in resps:
+        for resp_idx, resp in enumerate(resps):
+            expected_len = (
+                expected_lengths[resp_idx]
+                if resp_idx < len(expected_lengths)
+                else None
+            )
+            output_len = len(resp.output_tokens)
+            # debug for match between expected and actual response length
+            # logger.info(
+            #     "Simulated response length: expected=%s, actual=%s",
+            #     expected_len,
+            #     output_len,
+            # )
+            if expected_len is not None and output_len != expected_len:
+                logger.warning(
+                    "Simulated response length mismatch: expected %s tokens from max_new_token_list but received %s.",
+                    expected_len,
+                    output_len,
+                )
+
             seq = resp.input_tokens + resp.output_tokens
             logprobs = [0.0] * resp.input_len + resp.output_logprobs
             loss_mask = [0] * resp.input_len + [1] * resp.output_len

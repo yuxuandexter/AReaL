@@ -17,6 +17,7 @@ VALID_DATASETS = [
     "hh-rlhf",
     "torl_data",
     "deepscaler",
+    "deepscaler_simulation",
 ]
 
 logger = logging.getLogger("Dataset")
@@ -89,6 +90,26 @@ def _get_custom_dataset(
             path=path,
             split=split,
             processor=processor,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "deepscaler_simulation" in path.lower() and type == "sft":
+        from .deepscaler_simulation import get_deepscaler_simulation_sft_dataset
+
+        return get_deepscaler_simulation_sft_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "deepscaler_simulation" in path.lower() and type == "rl":
+        from .deepscaler_simulation import get_deepscaler_simulation_rl_dataset
+
+        return get_deepscaler_simulation_rl_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
             max_length=max_length,
             **kwargs,
         )

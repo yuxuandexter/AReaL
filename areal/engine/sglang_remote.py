@@ -38,6 +38,7 @@ class SGLangBackend:
             "temperature": 0.0 if gconfig.greedy else gconfig.temperature,
             "stop_token_ids": stop_token_ids,
             "frequency_penalty": gconfig.frequency_penalty,
+            "ignore_eos": gconfig.ignore_eos,
         }
         if stop:
             sample_params["stop"] = stop

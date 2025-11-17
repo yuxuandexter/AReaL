@@ -154,6 +154,16 @@ class GenerationHyperparameters:
             )
         },
     )
+    simulate_response: bool = field(
+        default=False,
+        metadata={
+            "help": "When True, workflows may short-circuit rollout by providing simulated responses instead of invoking the inference engine."
+        },
+    )
+    ignore_eos: bool = field(
+        default=False,
+        metadata={"help": "When True, generation ignores EOS token and continues until max tokens."},
+    )
 
     def new(self, **kwargs):
         args = asdict(self)
