@@ -81,7 +81,11 @@ class RLVRWorkflow(RolloutWorkflow):
                     rid=uuid.uuid4().hex,
                     input_ids=input_ids,
                     gconfig=self.gconfig.new(
-                        n_samples=1, max_new_tokens=per_sample_max, ignore_eos=True
+                        n_samples=1,
+                        max_new_tokens=per_sample_max,
+                        ignore_eos=True,
+                        stop_token_ids=[],
+                        stop=[],
                     ),
                     tokenizer=self.tokenizer,
                 )
@@ -113,11 +117,11 @@ class RLVRWorkflow(RolloutWorkflow):
             )
             output_len = len(resp.output_tokens)
             # debug for match between expected and actual response length
-            logger.info(
-                "Simulated response length: expected=%s, actual=%s",
-                expected_len,
-                output_len,
-            )
+            # logger.info(
+            #     "Simulated response length: expected=%s, actual=%s",
+            #     expected_len,
+            #     output_len,
+            # )
             if expected_len is not None and output_len != expected_len:
                 logger.warning(
                     "Simulated response length mismatch: expected %s tokens from max_new_token_list but received %s.",
