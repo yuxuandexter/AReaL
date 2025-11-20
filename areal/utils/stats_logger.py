@@ -36,15 +36,15 @@ class StatsLogger:
         if dist.is_initialized() and dist.get_rank() != 0:
             return
 
-        self.start_time = time.perf_counter()
-        # wandb init, connect to remote wandb host
-        if self.config.wandb.mode != "disabled":
-            wandb.login()
-
         if self.config.wandb.wandb_base_url:
             os.environ["WANDB_API_KEY"] = self.config.wandb.wandb_api_key
         if self.config.wandb.wandb_api_key:
             os.environ["WANDB_BASE_URL"] = self.config.wandb.wandb_base_url
+
+        self.start_time = time.perf_counter()
+        # wandb init, connect to remote wandb host
+        if self.config.wandb.mode != "disabled":
+            wandb.login()
 
         suffix = self.config.wandb.id_suffix
         if suffix == "timestamp":
@@ -118,14 +118,21 @@ class StatsLogger:
     def commit(self, epoch: int, step: int, global_step: int, data: dict | list[dict]):
         if dist.is_initialized() and mpu.is_initialized():
             if mpu.get_pipeline_model_parallel_world_size() > 1:
-                # log info only exist in last pipeline rank
+                # Some log info only exist in last pipeline rank
                 data_list = [data]
                 dist.broadcast_object_list(
                     data_list,
                     src=mpu.get_pipeline_model_parallel_last_rank(),
                     group=mpu.get_pipeline_model_parallel_group(),
                 )
-                data = data_list[0]
+                # Update to merge data in the last pipeline rank
+                # and data parallel head rank (rank 0)
+                if isinstance(data, dict):
+                    data.update(data_list[0])
+                elif isinstance(data, list):
+                    assert len(data) == len(data_list[0])
+                    for i in range(len(data)):
+                        data[i].update(data_list[0][i])
         if dist.is_initialized() and dist.get_rank() != 0:
             return
         logger.info(

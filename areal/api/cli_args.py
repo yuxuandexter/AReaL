@@ -1,7 +1,8 @@
 import argparse
 import json
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import MISSING as dataclass_missing
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -13,10 +14,12 @@ from hydra.core.global_hydra import GlobalHydra
 from omegaconf import MISSING, DictConfig, OmegaConf
 
 from areal.platforms import current_platform
-from areal.utils import name_resolve, pkg_version
+from areal.utils import logging, name_resolve, pkg_version
 from areal.utils.pkg_version import is_version_less
 
 uvloop.install()
+
+logger = logging.getLogger("CLI args")
 
 
 @dataclass
@@ -169,6 +172,47 @@ class GenerationHyperparameters:
         args = asdict(self)
         args.update(kwargs)
         return GenerationHyperparameters(**args)
+
+    def to_openai_args_dict(
+        self, exclude_args: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Convert the generation hyperparameters to a dictionary of arguments for OpenAI client."""
+        final_exclude_args = set(exclude_args) if exclude_args is not None else set()
+        final_exclude_args.update(
+            {
+                "min_new_tokens",  # Not supported by OpenAI
+                "greedy",  # Not directly supported by OpenAI
+                "top_k",  # Not supported by OpenAI
+                "stop_token_ids",  # Not supported by OpenAI
+            }
+        )
+
+        mapping = {
+            "n_samples": "n",
+            "max_new_tokens": "max_completion_tokens",
+        }
+        res = {}
+        for k, v in asdict(self).items():
+            if k in final_exclude_args:
+                should_warn = False
+
+                current_value = getattr(self, k)
+                f = next(_field for _field in fields(self) if _field.name == k)
+
+                # Check if equal to the default value
+                if f.default is not dataclass_missing:
+                    if current_value != f.default:
+                        should_warn = True
+                elif f.default_factory is not dataclass_missing:
+                    if current_value != f.default_factory():
+                        should_warn = True
+
+                if should_warn:
+                    logger.warning(f"Unsupported arg for openai format: `{k}`")
+                continue
+            res[mapping.get(k, k)] = v
+
+        return res
 
 
 # Train Engine Configs
@@ -388,9 +432,6 @@ class TrainEngineConfig:
     )
 
     weight_update_mode: str = field(default="disk")
-    backend: str = field(
-        default="", metadata={"help": "Training backend (refer to documentation)"}
-    )
     fsdp: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     megatron: MegatronEngineConfig = field(default_factory=MegatronEngineConfig)
 
@@ -533,7 +574,7 @@ class PPOActorConfig(TrainEngineConfig):
         metadata={
             "help": "Enable dynamic sampling (within DAPO). If enabled, groups with the same reward will be masked out. "
             "Note that enabling this option will lead to variable batch sizes. If you want to use a constant batch size with dynamic filtering, "
-            "you should use the `should_accept` parameter in `rollout_batch` and `prepare_batch`."
+            "you should use the `should_accept_fn` parameter in `prepare_batch`."
         },
     )
 
@@ -598,7 +639,7 @@ class vLLMConfig:
     model: str = ""
     seed: int = 1
     skip_tokenizer_init: bool = False
-    enforce_eager: bool = True
+    enforce_eager: bool = False
     dtype: str = "bfloat16"
     distributed_executor_backend: str = "mp"
     # original
@@ -607,7 +648,6 @@ class vLLMConfig:
     block_size: int = 16
     swap_space: int = 4
     cpu_offload_gb: float = 0
-    max_seq_len_to_capture: int = 32768
     disable_sliding_window: bool = True
     # NOTE: Defaults max_model_len to 32k because a larger value
     # will enable chunked prefill in vLLM, which will cause
@@ -631,14 +671,12 @@ class vLLMConfig:
         vllm_config: "vLLMConfig",
         tp_size: int,
         pp_size: int,
-        host: str,
-        port: int,
+        host: str | None = None,
+        port: int | None = None,
         dist_init_addr: str | None = None,
     ):
         args: dict = conf_as_dict(vllm_config)
         args = dict(
-            host=host,
-            port=port,
             # Model and tokenizer
             tokenizer=vllm_config.model,
             load_format="auto",
@@ -647,6 +685,10 @@ class vLLMConfig:
             pipeline_parallel_size=pp_size,
             **args,
         )
+        if port is not None:
+            args["port"] = port
+        if host is not None:
+            args["host"] = host
         return args
 
     @staticmethod
@@ -658,8 +700,8 @@ class vLLMConfig:
         vllm_config: "vLLMConfig",
         tp_size: int,
         pp_size: int,
-        host: str,
-        port: int,
+        host: str | None = None,
+        port: int | None = None,
         dist_init_addr: str | None = None,
     ):
         args = vLLMConfig.build_args(
@@ -752,8 +794,8 @@ class SGLangConfig:
         sglang_config: "SGLangConfig",
         tp_size,
         base_gpu_id,
-        host,
-        port,
+        host: str | None = None,
+        port: int | None = None,
         dist_init_addr: str | None = None,
         n_nodes: int = 1,
         node_rank: int = 0,
@@ -1016,15 +1058,15 @@ class StatsLoggerConfig:
 
 
 @dataclass
-class RequestTracerConfig:
-    """Configuration for per-request lifecycle tracing."""
+class SessionTracerConfig:
+    """Configuration for per-session lifecycle tracing."""
 
     enabled: bool = field(
         default=False,
         metadata={
             "help": (
-                "Enable per-request lifecycle tracing alongside perf events. "
-                "When true, request metadata is captured to requests.jsonl."
+                "Enable per-session lifecycle tracing alongside perf events. "
+                "When true, session metadata is captured to sessions.jsonl."
             )
         },
     )
@@ -1032,7 +1074,7 @@ class RequestTracerConfig:
         default=256,
         metadata={
             "help": (
-                "Flush request trace records once this many entries are ready. "
+                "Flush session trace records once this many entries are ready. "
                 "Values <= 0 fall back to 1."
             )
         },
@@ -1063,9 +1105,9 @@ class PerfTracerConfig:
             )
         },
     )
-    request_tracer: RequestTracerConfig | None = field(
+    session_tracer: SessionTracerConfig | None = field(
         default=None,
-        metadata={"help": "Request tracing configuration."},
+        metadata={"help": "Session tracing configuration."},
     )
 
 
@@ -1332,7 +1374,6 @@ class RWConfig(BaseExperimentConfig):
 @dataclass
 class GRPOConfig(BaseExperimentConfig):
     """Configuration for Group Relative Policy Optimization (GRPO) reinforcement learning experiments."""
-
     async_training: bool = field(
         default=True,
         metadata={
@@ -1352,9 +1393,12 @@ class GRPOConfig(BaseExperimentConfig):
         },
     )
     reward_timeout_seconds: float = field(
-        default=1.0,
+        default=0.5,
         metadata={
-            "help": "Timeout in seconds for reward function execution before aborting."
+            "help": (
+                "Timeout in seconds for reward function execution before aborting. "
+                "See benchmark/areal/deepscaler/areal_8k_config.yaml and areal_16k_config.yaml for typical values."
+            )
         },
     )
     gconfig: GenerationHyperparameters = field(

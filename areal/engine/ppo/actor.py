@@ -20,6 +20,7 @@ from areal.utils.functional import (
     ppo_actor_loss_fn,
     reward_overlong_penalty,
 )
+from areal.utils.perf_tracer import trace_perf
 
 logger = logging.getLogger(__name__)
 
@@ -67,18 +68,18 @@ class PPOActor:
         logger.info(f"  eps_clip: {config.eps_clip}")
         logger.info(f"  group_size: {config.group_size}")
 
+    @trace_perf("ppo_actor.compute_logp", category="compute")
     @torch.no_grad()
     def compute_logp(
         self,
         data: dict[str, Any],
-        temperature: float | None = None,
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor:
         def calc_logprobs(logits, input_data):
             labels = input_data.get(
                 "rolled_input_ids",
                 torch.roll(input_data["input_ids"], shifts=-1, dims=-1),
             )
-            logprobs = gather_logprobs(logits, labels, temperature or 1.0)
+            logprobs = gather_logprobs(logits, labels, self.temperature)
             return logprobs
 
         self.engine.eval()
@@ -88,6 +89,7 @@ class PPOActor:
             aggregate_fn=lambda xs: torch.cat(xs, dim=-1),
         )
 
+    @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(
         self, data: dict[str, Any], simulation_mode: bool | None = None
     ) -> None:
@@ -97,7 +99,6 @@ class PPOActor:
         if simulation_mode:
             self._simulate_advantages(data)
             return
-
         bs = data["input_ids"].shape[0]
         max_seqlen = data["input_ids"].shape[1]
         batch_indices = torch.arange(
@@ -197,6 +198,8 @@ class PPOActor:
         self._log_tensor_profile("tot_rewards", rewards)
         self._log_tensor_profile("loss_mask", loss_mask)
         self._log_tensor_profile("logprobs", old_logp)
+
+        return data
 
     def _simulate_advantages(self, data: dict[str, Any]) -> None:
         device = data["input_ids"].device
@@ -318,6 +321,12 @@ class PPOActor:
             zero_ratio,
         )
 
+
+
+
+
+    @trace_perf("ppo_actor.ppo_update", category="update")
+    @stats_tracker.scope_func_wrapper("ppo_actor")
     def ppo_update(self, data: dict[str, Any]) -> list[dict[str, float]]:
         if self.dynamic_sampling and len(data["rewards"]) % self.group_size == 0:
             data, sampling_stat = dynamic_sampling(data, self.group_size)
@@ -327,7 +336,6 @@ class PPOActor:
         reward_score = data["rewards"]
         seqlens = attn_mask.sum(-1)
 
-        all_stats = []
         ########## Logging code starts ##########
         result_denominators = {
             "correct_n_seqs": (reward_score > 0).bool(),
@@ -365,7 +373,6 @@ class PPOActor:
         )
         stats_tracker.stat(**stats, denominator="n_valid_tokens")
 
-        prompt_lens = []
         prompt_lens = data["attention_mask"].sum(-1) - data["loss_mask"].sum(-1)
         seq_stats = dict(
             no_eos_ratios=(seqlens == attn_mask.shape[-1]).float(),
@@ -392,15 +399,6 @@ class PPOActor:
                 **{k: data[k].float() for k in self.config.log_agent_stats_keys},
                 denominator="agent",
             )
-
-        global_stats = stats_tracker.export(
-            reduce_group=self.engine.data_parallel_group
-        )
-        for k in global_denominators:
-            keys = list(global_stats.keys())
-            for k2 in keys:
-                if k2.endswith(k):
-                    global_stats.pop(k2)
         ########## Logging code ends ##########
 
         for key in ["rewards", "tot_rewards", "kl_rewards", "versions"]:
@@ -411,27 +409,24 @@ class PPOActor:
             data,
             mb_spec=MicroBatchSpec(n_mbs=self.config.ppo_n_minibatches),
         )
-        for mb in mb_inputs.mbs:
-            train_stat = self.engine.train_batch(
-                mb,
-                loss_fn=functools.partial(
-                    grpo_loss_fn,
-                    temperature=self.temperature,
-                    eps_clip=self.config.eps_clip,
-                    eps_clip_higher=self.config.eps_clip_higher,
-                    c_clip=self.config.c_clip,
-                    behav_imp_weight_cap=self.config.behav_imp_weight_cap,
-                    m2_threshold=self.m2_threshold,
-                    importance_sampling_level=self.config.importance_sampling_level,
-                ),
-                loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
-            )
-            stats_tracker.scalar(**train_stat)
-            all_stats.append(
-                stats_tracker.export(reduce_group=self.engine.data_parallel_group)
-            )
-        all_stats[0].update(global_stats)
-        return all_stats
+
+        with stats_tracker.scope("update"):
+            for mb in mb_inputs.mbs:
+                train_stat = self.engine.train_batch(
+                    mb,
+                    loss_fn=functools.partial(
+                        grpo_loss_fn,
+                        temperature=self.temperature,
+                        eps_clip=self.config.eps_clip,
+                        eps_clip_higher=self.config.eps_clip_higher,
+                        c_clip=self.config.c_clip,
+                        behav_imp_weight_cap=self.config.behav_imp_weight_cap,
+                        m2_threshold=self.m2_threshold,
+                        importance_sampling_level=self.config.importance_sampling_level,
+                    ),
+                    loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+                )
+                stats_tracker.scalar(**train_stat)
 
 
 class FSDPPPOActor(FSDPEngine):
@@ -440,15 +435,15 @@ class FSDPPPOActor(FSDPEngine):
         self.actor = PPOActor(config, self)
 
     @torch.no_grad()
-    def compute_logp(self, *args, **kwargs) -> torch.Tensor | None:
+    def compute_logp(self, *args, **kwargs) -> torch.Tensor:
         return self.actor.compute_logp(*args, **kwargs)
 
     @torch.no_grad()
-    def compute_advantages(self, *args, **kwargs) -> None:
-        self.actor.compute_advantages(*args, **kwargs)
+    def compute_advantages(self, *args, **kwargs) -> dict[str, Any]:
+        return self.actor.compute_advantages(*args, **kwargs)
 
-    def ppo_update(self, *args, **kwargs) -> list[dict[str, float]]:
-        return self.actor.ppo_update(*args, **kwargs)
+    def ppo_update(self, *args, **kwargs) -> None:
+        self.actor.ppo_update(*args, **kwargs)
 
 
 class MegatronPPOActor(MegatronEngine):
@@ -457,15 +452,15 @@ class MegatronPPOActor(MegatronEngine):
         self.actor = PPOActor(config, self)
 
     @torch.no_grad()
-    def compute_logp(self, *args, **kwargs) -> torch.Tensor | None:
+    def compute_logp(self, *args, **kwargs) -> torch.Tensor:
         return self.actor.compute_logp(*args, **kwargs)
 
     @torch.no_grad()
-    def compute_advantages(self, *args, **kwargs) -> None:
-        self.actor.compute_advantages(*args, **kwargs)
+    def compute_advantages(self, *args, **kwargs) -> dict[str, Any]:
+        return self.actor.compute_advantages(*args, **kwargs)
 
-    def ppo_update(self, *args, **kwargs) -> list[dict[str, float]]:
-        return self.actor.ppo_update(*args, **kwargs)
+    def ppo_update(self, *args, **kwargs) -> None:
+        self.actor.ppo_update(*args, **kwargs)
 
 
 def grpo_loss_fn(

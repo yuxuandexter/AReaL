@@ -1,12 +1,8 @@
 """Test suite for remote inference engines (vLLM and SGLang)."""
 
 import os
-import subprocess
-import sys
-import time
 
 import pytest
-import requests
 import torch.distributed as dist
 
 from areal.api.cli_args import (
@@ -16,6 +12,7 @@ from areal.api.cli_args import (
     vLLMConfig,
 )
 from areal.api.io_struct import WeightUpdateMeta
+from areal.api.workflow_api import RolloutWorkflow
 from areal.utils import network
 from areal.utils.data import get_batch_size
 from areal.utils.hf_utils import load_hf_tokenizer
@@ -25,19 +22,7 @@ MODEL_PATH = "/storage/openpsi/models/Qwen__Qwen3-0.6B/"
 if not os.path.exists(MODEL_PATH):
     MODEL_PATH = "Qwen/Qwen3-0.6B"
 
-# set a large timeout since we may need to download the model from hub
-RUN_SERVER_TIMEOUT = 180
-
 IS_VLLM_INSTALLED = is_available("vllm")
-
-
-def check_server_health(base_url):
-    """Check if the server is healthy and ready to accept requests."""
-    try:
-        response = requests.get(f"{base_url}/health", timeout=30)
-        return response.status_code == 200
-    except requests.exceptions.RequestException:
-        return False
 
 
 def _dummy_reward_fn(*args, **kwargs):
@@ -61,7 +46,7 @@ def inference_engine(request):
 
     seeding.set_random_seed(1, expr_name)
 
-    port, dist_port = network.find_free_ports(2)
+    dist_port = network.find_free_ports(1)[0]
     host = network.gethostip()
 
     # Configure SGLang
@@ -75,8 +60,6 @@ def inference_engine(request):
         sglang_config=sglang_config,
         tp_size=1,
         base_gpu_id=0,
-        host=host,
-        port=port,
         dist_init_addr=f"{host}:{dist_port}",
     )
 
@@ -86,67 +69,52 @@ def inference_engine(request):
         model=MODEL_PATH,
         gpu_memory_utilization=0.2,
         max_model_len=128,
+        enforce_eager=True,  # reduce launch overhead
     )
     vllm_args = vLLMConfig.build_args(
         vllm_config=vllm_config,
         tp_size=1,
         pp_size=1,
-        host=host,
-        port=port,
     )
 
     # Launch remote server and initialize engine
     if backend == "vllm":
         from areal.engine.vllm_remote import RemotevLLMEngine
 
-        cmd = vLLMConfig.build_cmd_from_args(vllm_args)
         engine_class = RemotevLLMEngine
+        server_args = vllm_args
     else:  # sglang
         from areal.engine.sglang_remote import RemoteSGLangEngine
 
-        cmd = SGLangConfig.build_cmd_from_args(sglang_args)
         engine_class = RemoteSGLangEngine
+        server_args = sglang_args
 
-    # Launch process
-    process = subprocess.Popen(
-        cmd,
-        stdout=sys.stdout,
-        stderr=sys.stdout,
+    # Create engine instance for server management
+    temp_config = InferenceEngineConfig(
+        experiment_name=expr_name,
+        trial_name=trial_name,
+        setup_timeout=360,
     )
-    base_url = f"http://{host}:{port}"
-    tik = time.time()
+    server_manager = engine_class(temp_config)
+
     try:
-        while time.time() - tik < RUN_SERVER_TIMEOUT:
-            if check_server_health(base_url):
-                break
-            time.sleep(1)
-        if time.time() - tik > RUN_SERVER_TIMEOUT:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-            raise RuntimeError(f"{backend.upper()} server launch failed")
+        # Launch server via engine API
+        server_info = server_manager.launch_server(server_args)
 
         # Set environment for remote engine
-        os.environ["AREAL_LLM_SERVER_ADDRS"] = f"{host}:{port}"
+        os.environ["AREAL_LLM_SERVER_ADDRS"] = f"{server_info.host}:{server_info.port}"
 
         yield {
             "engine_class": engine_class,
             "expr_name": expr_name,
             "trial_name": trial_name,
             "host": host,
-            "port": port,
+            "port": server_info.port,
         }
     finally:
-        # Cleanup - ensure process is fully terminated
-        process.terminate()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+        # Cleanup using engine API
+        server_manager.teardown_server()
+        server_manager.destroy()
 
 
 # ============================================================================
@@ -167,6 +135,8 @@ def test_rollout(inference_engine, n_samples):
         max_concurrent_rollouts=2,
         consumer_batch_size=2,
         enable_rollout_tracing=True,
+        setup_timeout=360,
+        max_head_offpolicyness=int(1e10),
     )
 
     engine = inference_engine["engine_class"](config)
@@ -191,6 +161,18 @@ def test_rollout(inference_engine, n_samples):
     assert isinstance(result, dict)
     bs = get_batch_size(result)
     assert bs == 2 * n_samples
+
+    class NullWorkflow(RolloutWorkflow):
+        async def arun_episode(self, engine, data):
+            return None
+
+    # Test workflow returning None
+    result = engine.rollout_batch(
+        [data] * 2,
+        workflow=NullWorkflow(),
+    )
+    assert result == {}
+
     engine.destroy()
     assert not dist.is_initialized()
 
@@ -210,6 +192,7 @@ def test_staleness_control(inference_engine, bs, ofp, n_samples):
         consumer_batch_size=bs,
         max_head_offpolicyness=ofp,
         enable_rollout_tracing=True,
+        setup_timeout=360,
     )
 
     engine = inference_engine["engine_class"](config)

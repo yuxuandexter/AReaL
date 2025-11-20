@@ -2,10 +2,12 @@ from __future__ import annotations  # noqa
 
 import queue
 import random
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from collections import deque
 
 import torch
 import torch.distributed as dist
@@ -13,17 +15,21 @@ from megatron.core import parallel_state as mpu
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from areal.api.cli_args import InferenceEngineConfig
-from areal.api.engine_api import NO_RESULT, NoResult
 from areal.api.workflow_api import RolloutWorkflow
-from areal.core.async_task_runner import AsyncTaskRunner, TaskQueueFullError
+from areal.core.async_task_runner import (
+    AsyncTaskRunner,
+    TaskQueueFullError,
+    TimedResult,
+)
 from areal.core.staleness_manager import StalenessManager
 from areal.experimental.openai.types import InteractionWithTokenLogpReward
 from areal.utils import logging, perf_tracer
 from areal.utils.data import concat_padded_tensors, cycle_dataloader
+from areal.utils.dynamic_import import import_from_string
+from areal.utils.perf_tracer import trace_perf, trace_session_event
 
 if TYPE_CHECKING:
     from areal.api.engine_api import InferenceEngine
-    from areal.utils.perf_tracer import RequestTracer
 
 
 def check_trajectory_format(
@@ -214,14 +220,22 @@ class _RolloutTaskInput:
 
     data: dict[str, Any]
     workflow: RolloutWorkflow
-    should_accept: Callable | None = None
-    request_id: int | None = None
+    should_accept_fn: Callable[[dict[str, Any]], bool] | None = None
+    task_id: int | None = None
 
 
 @dataclass
 class _RolloutResult:
     trajectory: dict[str, Any]
-    request_id: int | None = None
+    task_id: int | None = None
+
+
+# Polling interval for background threads
+_POLL_INTERVAL_SECONDS = 0.5
+# Batch size for fetching from the async task runner
+_MAX_FETCH_BATCH_SIZE = 100
+# Timeout for shutting down threads
+_SHUTDOWN_TIMEOUT_SECONDS = 2.0
 
 
 class WorkflowExecutor:
@@ -229,16 +243,23 @@ class WorkflowExecutor:
 
     This class orchestrates the execution of rollout workflows with
     AReaL-specific features including staleness management, trajectory
-    validation, and result filtering. It uses a generic AsyncTaskRunner
-    internally for task execution while adding domain-specific logic for
-    RL training.
+    validation, and result filtering.
+
+    Architecture:
+    - Main thread: submit() enqueues to _pending_inputs, wait() polls _pending_results
+    - Producer thread (_commit_loop): transfers tasks from _pending_inputs to
+      AsyncTaskRunner based on staleness capacity
+    - Consumer thread (_fetch_loop): collects results from AsyncTaskRunner and
+      places them in _pending_results
+    - AsyncTaskRunner: generic async executor running workflows in background event loop
 
     The executor manages:
     - Integration with InferenceEngine for model generation
     - Staleness-aware capacity control via StalenessManager
     - Trajectory format validation
-    - Result filtering via should_accept callbacks
+    - Result filtering via should_accept_fn callbacks
     - InteractionWithTokenLogpReward processing
+    - Fail-fast error propagation from background threads
 
     Parameters
     ----------
@@ -275,7 +296,7 @@ class WorkflowExecutor:
 
         # Use provided staleness manager or create a default one
         # The manager will be properly initialized in initialize()
-        self.staleness_manager = staleness_manager
+        self._staleness_manager = staleness_manager
 
         # Create the generic async task runner
         qsize = config.queue_size or self.max_concurrent_rollouts * 16
@@ -287,13 +308,149 @@ class WorkflowExecutor:
         # For trajectory format checking
         self._expected_trajectory_keys: set | None = None
 
-        # Cache for tracking inputs and accepted/rejected results
-        self._pending_results: list[_RolloutResult] = []
-        self._pending_inputs: list[_RolloutTaskInput] = []
-        self._request_tracer: RequestTracer | None = None
+        # Unbounded deques for producer/consumer pattern
+        self._pending_inputs: deque[_RolloutTaskInput] = deque()
+        self._pending_results: deque[TimedResult[_RolloutResult]] = deque()
+
+        # Background thread infrastructure
+        self._shutdown_event = threading.Event()
+        self._commit_thread: threading.Thread | None = None
+        self._fetch_thread: threading.Thread | None = None
+
+        # Exception propagation for fail-fast behavior
+        self._thread_exception: Exception | None = None
+        self._thread_exception_lock = threading.Lock()
+
+    def _set_thread_exception(self, exc: Exception):
+        """Store exception from background thread for fail-fast behavior."""
+        with self._thread_exception_lock:
+            if self._thread_exception is None:  # First exception wins
+                self._thread_exception = exc
+
+    def _check_thread_exception(self):
+        """Check if any background thread has failed and raise if so (fail-fast)."""
+        with self._thread_exception_lock:
+            if self._thread_exception is not None:
+                raise RuntimeError(
+                    f"Background thread failed: {self._thread_exception}"
+                ) from self._thread_exception
+
+    def _commit_loop(self) -> None:
+        """Producer thread main loop - continuously submits tasks to runner based on capacity.
+
+        This method runs in a background thread and continuously:
+        1. Checks for errors from other threads (fail-fast)
+        2. Waits if runner is paused
+        3. Gets capacity from staleness manager based on current model version
+        4. Pulls up to 'capacity' tasks from _pending_inputs deque
+        5. Submits them to AsyncTaskRunner (handles TaskQueueFullError by re-inserting)
+        6. Updates staleness manager metrics on successful submission
+
+        The loop exits when _shutdown_event is set. Polling interval: 0.5s.
+        """
+
+        while not self._shutdown_event.is_set():
+            try:
+                # Check for errors from other threads (fail-fast)
+                self._check_thread_exception()
+
+                # Wait for resume if paused
+                if self.runner.paused.is_set():
+                    time.sleep(_POLL_INTERVAL_SECONDS)
+                    continue
+
+                # Get capacity from staleness manager
+                version = self.inference_engine.get_version()
+                capacity = self.staleness_manager.get_capacity(version)
+
+                if capacity <= 0:
+                    time.sleep(_POLL_INTERVAL_SECONDS)
+                    continue
+
+                # Try to submit up to 'capacity' tasks
+                for _ in range(capacity):
+                    try:
+                        task = self._pending_inputs.popleft()
+                    except IndexError:
+                        break
+
+                    # Submit to runner (may raise TaskQueueFullError)
+                    workflow_fn = self._create_workflow_task(task)
+                    try:
+                        self.runner.submit(workflow_fn)
+
+                        self.staleness_manager.on_rollout_submitted()
+                        if self.config.enable_rollout_tracing:
+                            self.logger.info(f"Submit rollout. {self._rollout_stats()}")
+                    except TaskQueueFullError:
+                        # Put back and retry later
+                        self._pending_inputs.appendleft(task)
+                        break
+
+                # Small sleep to avoid busy-waiting (latency-optimized)
+                time.sleep(_POLL_INTERVAL_SECONDS)
+
+            except Exception as e:
+                self.logger.error("Producer thread failed", exc_info=True)
+                self._set_thread_exception(e)
+                break
+
+    def _fetch_loop(self) -> None:
+        """Consumer thread main loop - continuously collects results from runner.
+
+        This method runs in a background thread and continuously:
+        1. Checks for errors from other threads (fail-fast)
+        2. Polls AsyncTaskRunner for available results (non-blocking)
+        3. Collects results in batches up to 100 with short timeout (0.05s)
+        4. Filters out None (rejected) results
+        5. Appends accepted TimedResult objects to _pending_results deque
+
+        The loop exits when _shutdown_event is set. Polling interval: 0.5s.
+        """
+        while not self._shutdown_event.is_set():
+            try:
+                # Check for errors from other threads (fail-fast)
+                self._check_thread_exception()
+
+                # Poll runner for available results (non-blocking)
+                output_queue_size = self.runner.get_output_queue_size()
+
+                if output_queue_size == 0:
+                    time.sleep(_POLL_INTERVAL_SECONDS)
+                    continue
+
+                # Collect all available results at once (batch for efficiency)
+                # Limit batch size to avoid blocking too long
+                count = min(output_queue_size, _MAX_FETCH_BATCH_SIZE)
+
+                try:
+                    # Use short timeout for responsiveness (latency-optimized)
+                    results = self.runner.wait(
+                        count=count, timeout=0.05, with_timing=True
+                    )
+
+                    # Enqueue all results. Filtering will be delayed to
+                    # `rollout_batch` or `prepare_batch`.
+                    for result in results:
+                        self._pending_results.append(result)
+
+                except TimeoutError:
+                    # No results ready yet
+                    pass
+
+                # Small sleep to avoid busy-waiting (latency-optimized)
+                time.sleep(_POLL_INTERVAL_SECONDS)
+
+            except Exception as e:
+                self.logger.error("Consumer thread failed", exc_info=True)
+                self._set_thread_exception(e)
+                break
 
     def initialize(self, logger=None, train_data_parallel_size: int | None = None):
-        """Initialize the workflow executor and start the async task runner.
+        """Initialize the workflow executor and start background threads.
+
+        Initializes StalenessManager (if needed), AsyncTaskRunner, and starts
+        producer (_commit_loop) and consumer (_fetch_loop) threads.
 
         Parameters
         ----------
@@ -315,7 +472,7 @@ class WorkflowExecutor:
         self.logger = logger
 
         # Initialize staleness manager if not provided
-        if self.staleness_manager is None:
+        if self._staleness_manager is None:
             if train_data_parallel_size is not None:
                 dp_world_size = train_data_parallel_size
             else:
@@ -333,7 +490,7 @@ class WorkflowExecutor:
             )
             consumer_batch_size = max(1, self.consumer_batch_size // dp_world_size)
 
-            self.staleness_manager = StalenessManager(
+            self._staleness_manager = StalenessManager(
                 max_concurrent_rollouts=max_concurrent_rollouts,
                 consumer_batch_size=consumer_batch_size,
                 max_staleness=self.config.max_head_offpolicyness,
@@ -341,17 +498,47 @@ class WorkflowExecutor:
 
         # Initialize the generic async task runner
         self.runner.initialize(logger=logger)
-        self._request_tracer = perf_tracer.get_request_tracer()
+
+        # Start background threads for producer and consumer
+        self._shutdown_event.clear()
+
+        self._commit_thread = threading.Thread(target=self._commit_loop)
+        self._commit_thread.start()
+
+        self._fetch_thread = threading.Thread(target=self._fetch_loop)
+        self._fetch_thread.start()
 
     def destroy(self):
-        """Shutdown the workflow executor and clean up resources."""
-        # Get tracer, preferring instance-level but falling back to global
-        tracer = self._request_tracer
-        if tracer is None:
-            tracer = perf_tracer.get_request_tracer()
-        # Flush if a tracer was found
+        """Shutdown the workflow executor and clean up resources.
+
+        Signals shutdown, waits for threads to exit (5s timeout each),
+        flushes perf tracer, and destroys AsyncTaskRunner.
+        """
+        # Signal shutdown to background threads
+        self._shutdown_event.set()
+
+        # Wait for producer thread to finish (with timeout)
+        if self._commit_thread and self._commit_thread.is_alive():
+            self._commit_thread.join(timeout=_SHUTDOWN_TIMEOUT_SECONDS)
+            if self._commit_thread.is_alive():
+                self.logger.warning(
+                    "Producer thread did not exit cleanly within timeout"
+                )
+
+        # Wait for consumer thread to finish (with timeout)
+        if self._fetch_thread and self._fetch_thread.is_alive():
+            self._fetch_thread.join(timeout=_SHUTDOWN_TIMEOUT_SECONDS)
+            if self._fetch_thread.is_alive():
+                self.logger.warning(
+                    "Consumer thread did not exit cleanly within timeout"
+                )
+
+        # Flush performance tracer
+        tracer = perf_tracer.get_session_tracer()
         if tracer is not None:
             tracer.flush(force=True)
+
+        # Shutdown the async task runner
         self.runner.destroy()
 
     def get_capacity(self):
@@ -366,11 +553,124 @@ class WorkflowExecutor:
         capacity = self.staleness_manager.get_capacity(version)
         return capacity
 
-    def _trace(self, request_id: int | None, method: str, **kwargs) -> None:
-        tracer = self._request_tracer
-        if tracer is None or request_id is None:
-            return
-        getattr(tracer, method)(request_id, **kwargs)
+    def _resolve_workflow(
+        self,
+        workflow: RolloutWorkflow | type[RolloutWorkflow] | str,
+        workflow_kwargs: dict[str, Any] | None,
+    ) -> RolloutWorkflow:
+        """Resolve workflow parameter to a RolloutWorkflow instance.
+
+        Parameters
+        ----------
+        workflow : RolloutWorkflow | type[RolloutWorkflow] | str
+            The workflow specification
+        workflow_kwargs : Dict[str, Any] | None
+            Keyword arguments for workflow initialization
+
+        Returns
+        -------
+        RolloutWorkflow
+            A workflow instance ready to use
+
+        Raises
+        ------
+        ValueError
+            If workflow_kwargs is required but not provided
+        TypeError
+            If workflow type is invalid
+        """
+
+        # Case 1: Already a workflow instance
+        if isinstance(workflow, RolloutWorkflow):
+            if workflow_kwargs is not None:
+                self.logger.warning(
+                    "workflow_kwargs is ignored when workflow is already an instance"
+                )
+            return workflow
+
+        workflow_class: type[RolloutWorkflow]
+
+        # Resolve to a class type
+        if isinstance(workflow, str):
+            try:
+                imported_obj = import_from_string(workflow)
+            except (ValueError, ImportError, AttributeError) as e:
+                raise ValueError(
+                    f"Failed to import workflow from string {workflow!r}: {e}"
+                ) from e
+
+            if not isinstance(imported_obj, type) or not issubclass(
+                imported_obj, RolloutWorkflow
+            ):
+                raise TypeError(
+                    f"Imported object from {workflow!r} is not a valid RolloutWorkflow class."
+                )
+            workflow_class = imported_obj
+        elif isinstance(workflow, type) and issubclass(workflow, RolloutWorkflow):
+            workflow_class = workflow
+        else:
+            raise TypeError(
+                f"Invalid workflow type: {type(workflow)}. "
+                f"Expected RolloutWorkflow instance, RolloutWorkflow class, or string module path."
+            )
+
+        # Instantiate the class
+        if workflow_kwargs is None:
+            raise ValueError(
+                f"workflow_kwargs is required when workflow is a class or string. "
+                f"Got workflow={workflow}, but workflow_kwargs=None."
+            )
+
+        try:
+            return workflow_class(**workflow_kwargs)
+        except Exception as e:
+            raise TypeError(
+                f"Failed to instantiate workflow class {workflow_class} "
+                f"with kwargs {workflow_kwargs}: {e}"
+            ) from e
+
+    def _resolve_should_accept_fn(
+        self, should_accept_fn: Callable[[dict[str, Any]], bool] | str | None
+    ) -> Callable[[dict[str, Any]], bool] | None:
+        """Resolve should_accept_fn parameter to a callable or None.
+
+        Parameters
+        ----------
+        should_accept_fn : Callable[[Dict[str, Any]], bool] | str | None
+            The should_accept_fn specification
+
+        Returns
+        -------
+        Callable[[Dict[str, Any]], bool] | None
+            A callable for trajectory filtering, or None
+
+        Raises
+        ------
+        ValueError
+            If string import fails
+        TypeError
+            If imported object is not callable
+        """
+        if should_accept_fn is None or callable(should_accept_fn):
+            return should_accept_fn
+
+        if isinstance(should_accept_fn, str):
+            try:
+                func = import_from_string(should_accept_fn)
+            except (ValueError, ImportError, AttributeError) as e:
+                raise ValueError(
+                    f"Failed to import should_accept_fn from string {should_accept_fn!r}: {e}"
+                ) from e
+            if not callable(func):
+                raise TypeError(
+                    f"Imported object {func} from {should_accept_fn!r} is not callable"
+                )
+            return func
+
+        raise TypeError(
+            f"Invalid should_accept_fn type: {type(should_accept_fn)}. "
+            f"Expected callable or string module path."
+        )
 
     def _rollout_stats(self) -> str:
         stats = self.staleness_manager.get_stats()
@@ -382,16 +682,16 @@ class WorkflowExecutor:
         )
 
     def _create_workflow_task(
-        self, task_input: _RolloutTaskInput
-    ) -> Callable[[], Awaitable[dict[str, Any] | None]]:
+        self, pending_task: _RolloutTaskInput
+    ) -> Callable[[], Awaitable[_RolloutResult | None]]:
         """Wrapper to create an async function that will be executed by AsyncTaskRunner.
 
         This is a synchronous function that returns an async function, which allows
-        us to capture the task_input context.
+        us to capture the pending_task context.
 
         Parameters
         ----------
-        task_input : _RolloutTaskInput
+        pending_task : _RolloutTaskInput
             The rollout task input containing workflow, data, and filter callback.
 
         Returns
@@ -401,18 +701,22 @@ class WorkflowExecutor:
             filtering/validation.
         """
 
-        async def _execute_workflow():
+        async def _execute_workflow() -> _RolloutResult | None:
             """Execute workflow.arun_episode and apply AReaL-specific logic."""
-            request_id = task_input.request_id
-            self._trace(request_id, "mark_execution_start")
+            task_id = pending_task.task_id
 
+            # Set task_id in ContextVar before entering arun_episode
+            perf_tracer.set_task_id(task_id)
+
+            manager = self.staleness_manager
             traj: dict[str, Any] | None = None
-            should_accept_result: bool | None = None
-            rejection_reason: str | None = None
+            should_accept_fn = pending_task.should_accept_fn
+            should_accept: bool | None = None
+            reason: str | None = None
 
             try:
-                traj = await task_input.workflow.arun_episode(
-                    self.inference_engine, task_input.data
+                traj = await pending_task.workflow.arun_episode(
+                    self.inference_engine, pending_task.data
                 )
 
                 # Trajectory format checking
@@ -443,44 +747,36 @@ class WorkflowExecutor:
 
                 if traj is None:
                     should_accept_traj = False
-                    rejection_reason = "workflow_returned_none"
+                    reason = "returned_none"
                 else:
-                    if task_input.should_accept is None:
-                        should_accept_result = True
+                    if should_accept_fn is None:
+                        should_accept = True
                     else:
-                        should_accept_result = bool(task_input.should_accept(traj))
-                    should_accept_traj = bool(should_accept_result)
-                    if not should_accept_traj and task_input.should_accept is not None:
-                        rejection_reason = "should_accept_false"
+                        should_accept = bool(should_accept_fn(traj))
+                    should_accept_traj = bool(should_accept)
+                    if not should_accept_traj and should_accept_fn is not None:
+                        reason = "rejected"
 
                 if should_accept_traj:
-                    self.staleness_manager.on_rollout_accepted()
-                    stats = self.staleness_manager.get_stats()
-                    self._trace(
-                        request_id,
-                        "mark_execution_end",
+                    manager.on_rollout_accepted()
+                    trace_session_event(
+                        "mark_finalized",
+                        task_id=task_id,
                         status="accepted",
-                        should_accept=should_accept_result,
-                        staleness=stats,
                     )
                     if self.config.enable_rollout_tracing:
                         self.logger.info(
                             f"Finish and accept rollout. {self._rollout_stats()}",
                         )
-                    return _RolloutResult(
-                        request_id=request_id,
-                        trajectory=traj,
-                    )
+                    assert traj is not None
+                    return _RolloutResult(task_id=task_id, trajectory=traj)
 
-                self.staleness_manager.on_rollout_rejected()
-                stats = self.staleness_manager.get_stats()
-                self._trace(
-                    request_id,
-                    "mark_execution_end",
+                manager.on_rollout_rejected()
+                trace_session_event(
+                    "mark_finalized",
+                    task_id=task_id,
                     status="rejected",
-                    should_accept=should_accept_result,
-                    rejection_reason=rejection_reason,
-                    staleness=stats,
+                    reason=reason,
                 )
                 if self.config.enable_rollout_tracing:
                     self.logger.info(
@@ -489,15 +785,12 @@ class WorkflowExecutor:
                 return None
 
             except Exception as exc:  # pragma: no cover - workflow execution errors
-                self.staleness_manager.on_rollout_rejected()
-                stats = self.staleness_manager.get_stats()
-                self._trace(
-                    request_id,
-                    "mark_execution_end",
+                manager.on_rollout_rejected()
+                trace_session_event(
+                    "mark_finalized",
+                    task_id=task_id,
                     status="failed",
-                    should_accept=None,
-                    rejection_reason="workflow_exception",
-                    staleness=stats,
+                    reason="workflow_exception",
                 )
                 if self.logger is not None:
                     self.logger.error(
@@ -510,153 +803,110 @@ class WorkflowExecutor:
     def submit(
         self,
         data: dict[str, Any],
-        workflow: RolloutWorkflow | None = None,
-        workflow_builder: Callable | None = None,
-        should_accept: Callable | None = None,
+        workflow: RolloutWorkflow | type[RolloutWorkflow] | str,
+        workflow_kwargs: dict[str, Any] | None = None,
+        should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
     ) -> None:
-        """Submit a request to the workflow executor.
+        """Submit a rollout request to the workflow executor.
 
-        See :meth:`~areal.api.engine_api.InferenceEngine.submit` for detailed
-        documentation.
+        Enqueues the request to _pending_inputs. The background producer thread
+        will submit it to AsyncTaskRunner when staleness capacity allows. Non-blocking.
+
+        See :meth:`~areal.api.engine_api.InferenceEngine.submit` for parameters.
         """
-        # Create workflow if builder provided
-        if workflow is None:
-            workflow = workflow_builder()
+        # Check for thread errors (fail-fast)
+        self._check_thread_exception()
 
-        request_id = None
-        current_tracer = self._request_tracer
-        if current_tracer is not None:
-            request_id = current_tracer.register_submission()
-        self._pending_inputs.append(
-            _RolloutTaskInput(
-                data=data,
-                workflow=workflow,
-                should_accept=should_accept,
-                request_id=request_id,
-            )
+        # Resolve workflow and should_accept to their concrete forms
+        resolved_workflow = self._resolve_workflow(workflow, workflow_kwargs)
+        resolved_should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
+
+        task_id = perf_tracer.register_task()
+        task_input = _RolloutTaskInput(
+            data=data,
+            workflow=resolved_workflow,
+            should_accept_fn=resolved_should_accept_fn,
+            task_id=task_id,
         )
+
+        # Enqueue to thread-safe queue (may block if queue is full)
+        self._pending_inputs.append(task_input)
 
         # Notify staleness manager of enqueued rollout tasks
         self.staleness_manager.on_rollout_enqueued()
         if self.config.enable_rollout_tracing:
             self.logger.info(f"Enqueue rollout. {self._rollout_stats()}")
 
-    def _commit_one_to_runner(self):
-        task_input = self._pending_inputs.pop(0)
-        # Create the async workflow execution function and submit to runner
-        workflow_fn = self._create_workflow_task(task_input)
-        try:
-            self.runner.submit(workflow_fn)
-            self._trace(task_input.request_id, "mark_enqueued")
-        except TaskQueueFullError:
-            self._trace(
-                task_input.request_id,
-                "mark_dropped",
-                reason="input_queue_full",
-            )
-            # Convert RuntimeError from AsyncTaskRunner to queue.Full for
-            # backward compatibility
-            raise queue.Full("Input queue full. Please increase queue_size.")
-
-        # Notify staleness manager of submission only after successful submission
-        self.staleness_manager.on_rollout_submitted()
-        if self.config.enable_rollout_tracing:
-            self.logger.info(f"Submit rollout. {self._rollout_stats()}")
-
     def wait(
         self, count: int, timeout: float | None = None, raise_timeout: bool = True
-    ) -> dict[str, Any] | NoResult:
-        """Wait for workflow results.
+    ) -> dict[str, Any]:
+        """Wait for the completion of `count` workflows from _pending_results deque.
 
-        See :meth:`~areal.api.engine_api.InferenceEngine.wait` for detailed
-        documentation.
+        Polls _pending_results (populated by consumer thread), sorts by create_time,
+        shuffles, and returns concatenated batch tensors.
+
+        See :meth:`~areal.api.engine_api.InferenceEngine.wait` for parameters.
         """
+        if count <= 0:
+            raise ValueError(f"count must be positive, got {count}")
+
         start_time = time.perf_counter()
         timeout = timeout or float(7 * 24 * 3600)
 
-        # Keep requesting results from runner until we have enough accepted
-        # (non-None) results. Use short timeout (1 second) for each wait call
-        # to allow periodic checking. This matches original behavior where
-        # wait() would poll and allow prepare_batch() to continue
-        while True:
-            # Submit pending inputs
-            # Check capacity before submitting
-            capacity = self.get_capacity()
-            # Submit pending tasks
-            for _ in range(capacity):
-                if len(self._pending_inputs) == 0:
-                    break
-                self._commit_one_to_runner()
+        while time.perf_counter() - start_time < timeout:
+            self._check_thread_exception()
 
             if len(self._pending_results) >= count:
                 break
 
             elapsed = time.perf_counter() - start_time
-            remaining_timeout = timeout - elapsed
+            remaining = timeout - elapsed
+            time.sleep(min(_POLL_INTERVAL_SECONDS, remaining))
 
-            if remaining_timeout <= 0:
-                if raise_timeout:
-                    raise TimeoutError(
-                        f"Timed out waiting for {count} rollouts, only received "
-                        f"{len(self._pending_results)}."
-                    )
-                else:
-                    return NO_RESULT
-
-            # Try to get at least the number we still need, but request at least 1
-            # Note: runner.wait() might return fewer due to rejections (None results)
-            needed = max(1, count - len(self._pending_results))
-
-            try:
-                # Use short timeout to allow periodic returns (matches original
-                # polling behavior)
-                batch = self.runner.wait(
-                    count=needed, timeout=min(0.1, remaining_timeout)
+        if len(self._pending_results) < count:
+            if raise_timeout:
+                raise TimeoutError(
+                    f"Timed out waiting for {count} rollouts, "
+                    f"only received {len(self._pending_results)}"
                 )
+            else:
+                return {}
 
-                # Filter out None results (rejected trajectories)
-                # runner.wait() returns List[T] where T can be None for
-                # rejected rollouts
-                accepted = [result for result in batch if result is not None]
-                self._pending_results.extend(accepted)
-            except TimeoutError:
-                pass
-
+        # Log and trace
         if self.config.enable_rollout_tracing:
             self.logger.info("Rollout results are ready!")
 
-        perf_tracer.instant(
-            "workflow_executor.wait",
-            category="scheduler",
-            args={
-                "queue_size": self.runner.get_output_queue_size(),
-                "pending_results": len(self._pending_results),
-            },
-        )
-
-        # Extract requested number of results
-        results = self._pending_results[:count]
-        self._pending_results = self._pending_results[count:]
+        # Drain all available requests and sort them by time of creation
+        # This prioritizes data submitted earlier.
+        results: list[TimedResult[_RolloutResult]] = []
+        while True:
+            try:
+                results.append(self._pending_results.popleft())
+            except IndexError:
+                break
+        # Sort results be create time
+        results.sort(key=lambda x: x.create_time)
+        results, pending = results[:count], results[count:]
+        self._pending_results.extendleft(reversed(pending))
 
         # Shuffle for randomness (helps with data diversity)
         random.shuffle(results)
 
         # Concatenate into batch tensor format
-        trajectories: list[dict[str, Any]] = []
-        for result in results:
-            self._trace(result.request_id, "mark_consumed")
-            trajectories.append(result.trajectory)
-
+        trajectories = [r.data.trajectory for r in results if r.data is not None]
         return concat_padded_tensors(trajectories)
 
+    @trace_perf("workflow_executor.rollout_batch", category="scheduler")
     def rollout_batch(
         self,
         data: list[dict[str, Any]],
-        workflow: RolloutWorkflow | None = None,
-        workflow_builder: Callable | None = None,
-        should_accept: Callable | None = None,
+        workflow: RolloutWorkflow | type[RolloutWorkflow] | str,
+        workflow_kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Submit a batch of requests and wait for results.
+
+        This method does not support asynchronous rollout and should be used for offline
+        data collection or debugging, not in production experiments.
 
         See :meth:`~areal.api.engine_api.InferenceEngine.rollout_batch` for
         detailed documentation.
@@ -670,30 +920,35 @@ class WorkflowExecutor:
             self.submit(
                 data=item,
                 workflow=workflow,
-                workflow_builder=workflow_builder,
-                should_accept=should_accept,
+                workflow_kwargs=workflow_kwargs,
             )
         return self.wait(count=len(data))
 
+    @trace_perf("workflow_executor.prepare_batch", category="scheduler")
     def prepare_batch(
         self,
         dataloader: StatefulDataLoader,
-        workflow: RolloutWorkflow | None = None,
-        workflow_builder: Callable | None = None,
-        should_accept: Callable | None = None,
+        workflow: RolloutWorkflow | type[RolloutWorkflow] | str,
+        workflow_kwargs: dict[str, Any] | None = None,
+        should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
     ):
         """Prepare a batch with controlled staleness.
 
-        See :meth:`~areal.api.engine_api.InferenceEngine.prepare_batch` for
-        detailed documentation.
+        Continuously submits from dataloader and waits for results, ensuring at least
+        two batches are pending to maximize overlap.
+
+        See :meth:`~areal.api.engine_api.InferenceEngine.prepare_batch` for parameters.
         """
+        manager = self.staleness_manager
         if not hasattr(self, "data_generator"):
             self.data_generator = cycle_dataloader(dataloader)
         assert dataloader.batch_size is not None
+        cnt = 0
+        results = []
         while True:
             # Submit at least two batches to allow maximum overlap
             if (
-                len(self._pending_inputs) < self.staleness_manager.get_pending_limit()
+                len(self._pending_inputs) < manager.get_pending_limit()
                 and self.runner.get_input_queue_size() + dataloader.batch_size
                 < self.runner.max_queue_size
             ):
@@ -707,13 +962,20 @@ class WorkflowExecutor:
                     self.submit(
                         item,
                         workflow=workflow,
-                        workflow_builder=workflow_builder,
-                        should_accept=should_accept,
+                        should_accept_fn=should_accept_fn,
+                        workflow_kwargs=workflow_kwargs,
                     )
             try:
-                return self.wait(dataloader.batch_size, timeout=1)
+                res = self.wait(count=1, timeout=1)
+                if not res:
+                    continue
+                cnt += 1
+                results.append(res)
+                if cnt >= dataloader.batch_size:
+                    break
             except (TimeoutError, queue.Full):
                 pass
+        return concat_padded_tensors(results)
 
     def pause(self):
         """Pause request submission for async rollout.
@@ -733,3 +995,12 @@ class WorkflowExecutor:
 
     def is_paused(self):
         return self.runner.paused.is_set()
+
+    @property
+    def staleness_manager(self) -> StalenessManager:
+        manager = self._staleness_manager
+        if manager is None:
+            raise RuntimeError(
+                "WorkflowExecutor.initialize() must be called before scheduling rollouts."
+            )
+        return manager

@@ -41,7 +41,8 @@ from areal.core.dist_rollout import DistRolloutCoordinator
 from areal.engine.base_hf_engine import BaseHFEngine
 from areal.models.transformers.ulyssess_patch import apply_monkey_patch
 from areal.platforms import current_platform
-from areal.utils import logging, name_resolve, names, perf_tracer, pkg_version
+from areal.utils import logging, name_resolve, names, pkg_version
+from areal.utils.constants import DIST_GROUP_DEFAULT_TIMEOUT
 from areal.utils.data import (
     pack_tensor_dict,
     pad_and_stack_tensors_along_first_dim,
@@ -54,7 +55,7 @@ from areal.utils.fsdp.checkpoint import DCPState
 from areal.utils.fsdp.grad import fsdp2_clip_grad_norm
 from areal.utils.fsdp.optimizer import AnyPrecisionAdamW
 from areal.utils.fsdp.parallel import ParallelHelper, parallelize_model
-from areal.utils.nccl import NCCL_DEFAULT_TIMEOUT
+from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.save_load import get_state_dict_from_repo_id_or_path
 from areal.utils.ulysses import (
     set_ulysses_sequence_parallel_group,
@@ -138,7 +139,7 @@ class FSDPEngine(BaseHFEngine):
 
         self.rank = dist.get_rank()
 
-        self.dp_head = int(self.world_mesh["sp_tp"].mesh[0].item())
+        self.dp_head = dist.get_process_group_ranks(self.mp_group)[0]
         self.dp_rank = dist.get_rank(self.dp_group)
 
         self.logger.info(f"Data parallel head {self.dp_head} and rank {self.dp_rank}")
@@ -322,6 +323,7 @@ class FSDPEngine(BaseHFEngine):
         if self.rank == 0:
             self.model.print_trainable_parameters()
 
+    @trace_perf("fsdp_engine.update_bucket", category="comm")
     def _update_bucket_weights_from_distributed(
         self,
         meta: WeightUpdateMeta,
@@ -378,11 +380,12 @@ class FSDPEngine(BaseHFEngine):
                 init_method=f"tcp://{meta.nccl_master_address}:{meta.nccl_master_port}",
                 rank=0,
                 group_name=meta.nccl_group_name,
-                timeout=NCCL_DEFAULT_TIMEOUT,
+                timeout=DIST_GROUP_DEFAULT_TIMEOUT,
             )
 
             fut.result()
 
+    @trace_perf("fsdp_engine.update_weights_from_distributed", category="comm")
     def _update_weights_from_distributed(self, meta: WeightUpdateMeta):
         """Broadcast parameters (chunked) from rank 0 (FSDP2 compatible)."""
 
@@ -427,6 +430,7 @@ class FSDPEngine(BaseHFEngine):
         dist.barrier(device_ids=[self.device.index])
         current_platform.synchronize()
 
+    @trace_perf("fsdp_engine.update_weights_from_disk", category="io")
     def _update_weights_from_disk(self, meta: WeightUpdateMeta):
         fut = Future()
 
@@ -493,36 +497,40 @@ class FSDPEngine(BaseHFEngine):
         self,
         data: list[dict[str, Any]],
         granularity: int = 1,
-        workflow: RolloutWorkflow | None = None,
-        workflow_builder: Callable | None = None,
-        should_accept: Callable | None = None,
+        workflow: RolloutWorkflow | type[RolloutWorkflow] | str | None = None,
+        workflow_kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """Submit a batch of requests and wait for results.
+
+        This method does not support asynchronous rollout and should be used for offline
+        data collection or debugging, not in production experiments.
+        """
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.rollout_batch(
             data,
             granularity=granularity,
             workflow=workflow,
-            workflow_builder=workflow_builder,
-            should_accept=should_accept,
+            workflow_kwargs=workflow_kwargs,
         )
 
     def prepare_batch(
         self,
         dataloader: StatefulDataLoader,
         granularity: int = 1,
-        workflow: RolloutWorkflow | None = None,
-        workflow_builder: Callable | None = None,
-        should_accept: Callable | None = None,
+        workflow: RolloutWorkflow | type[RolloutWorkflow] | str | None = None,
+        workflow_kwargs: dict[str, Any] | None = None,
+        should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
     ) -> dict[str, Any]:
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.prepare_batch(
             dataloader,
             granularity=granularity,
             workflow=workflow,
-            workflow_builder=workflow_builder,
-            should_accept=should_accept,
+            workflow_kwargs=workflow_kwargs,
+            should_accept_fn=should_accept_fn,
         )
 
+    @trace_perf("fsdp_engine.train_batch", category="compute")
     def train_batch(
         self,
         input_: dict[str, Any],
@@ -595,7 +603,7 @@ class FSDPEngine(BaseHFEngine):
             else:
                 inputs = padded_mb_input
 
-            with perf_tracer.trace_scope("fsdp_engine.train_batch.forward"):
+            with trace_scope("fsdp_engine.train_batch.forward"):
                 outputs = self.model(**inputs)
 
             logits = outputs.logits.squeeze(0)
@@ -611,7 +619,7 @@ class FSDPEngine(BaseHFEngine):
             loss_scale *= self.parallel_helper.dp_size
 
             loss *= loss_scale
-            with perf_tracer.trace_scope("fsdp_engine.train_batch.backward"):
+            with trace_scope("fsdp_engine.train_batch.backward"):
                 loss.backward()
 
         grad_norm = fsdp2_clip_grad_norm(
@@ -624,7 +632,7 @@ class FSDPEngine(BaseHFEngine):
             self.optimizer.zero_grad()
             update_successful = False
         else:
-            with perf_tracer.trace_scope("fsdp_engine.train_batch.step"):
+            with trace_scope("fsdp_engine.train_batch.step"):
                 self.optimizer.step()
             update_successful = True
 
@@ -635,6 +643,7 @@ class FSDPEngine(BaseHFEngine):
             lr=current_lr,
         )
 
+    @trace_perf("fsdp_engine.eval_batch", category="compute")
     @torch.no_grad()
     def eval_batch(
         self,
@@ -703,7 +712,7 @@ class FSDPEngine(BaseHFEngine):
             else:
                 inputs = padded_mb_input
 
-            with perf_tracer.trace_scope("fsdp_engine.eval_batch.forward"):
+            with trace_scope("fsdp_engine.eval_batch.forward"):
                 outputs = self.model(**inputs)
 
             logits = outputs.logits.squeeze(0)
@@ -723,6 +732,7 @@ class FSDPEngine(BaseHFEngine):
 
         return total_loss
 
+    @trace_perf("fsdp_engine.forward", category="compute")
     @torch.no_grad()
     def forward(
         self,
@@ -788,7 +798,7 @@ class FSDPEngine(BaseHFEngine):
             else:
                 inputs = padded_mb_input
 
-            with perf_tracer.trace_scope("fsdp_engine.forward.forward"):
+            with trace_scope("fsdp_engine.forward.forward"):
                 outputs = self.model(**inputs)
 
             logits = outputs.logits.squeeze(0)

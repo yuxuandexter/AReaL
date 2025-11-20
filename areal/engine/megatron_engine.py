@@ -34,7 +34,8 @@ from areal.models.mcore.hf_load import load_weights_from_hf_with_mbridge_fast
 from areal.models.mcore.hf_save import save_weights_to_hf_with_mbridge_fast
 from areal.models.mcore.registry import make_hf_and_mcore_config, make_mcore_model
 from areal.platforms import current_platform
-from areal.utils import logging, name_resolve, names, perf_tracer
+from areal.utils import logging, name_resolve, names
+from areal.utils.constants import DIST_GROUP_DEFAULT_TIMEOUT
 from areal.utils.data import (
     MicroBatchList,
     amend_position_ids,
@@ -63,7 +64,7 @@ from areal.utils.megatron import (
 )
 from areal.utils.megatron_checkpointer import MegatronCheckpointManager
 from areal.utils.model import disable_dropout_in_model
-from areal.utils.nccl import NCCL_DEFAULT_TIMEOUT
+from areal.utils.perf_tracer import trace_perf, trace_scope
 
 
 class _MegatronModelList(list):
@@ -241,13 +242,14 @@ class MegatronEngine(TrainEngine):
         if parallel_strategy is None:
             parallel_strategy = ParallelStrategy()
         self.parallel_strategy = self._make_parallel_strategy(parallel_strategy)
+        backend = current_platform.communication_backend
         if not dist.is_initialized():
             # TODO: Handle the condition when WORLD_SIZE and RANK is not set in launcher
             # NOTE: device_id **SHOULD NOT** be passed into init_process_group,
             # otherwise initializing the NCCL weight update group will be wrong!
             dist.init_process_group(
-                backend="nccl",
-                timeout=NCCL_DEFAULT_TIMEOUT,
+                backend=backend,
+                timeout=DIST_GROUP_DEFAULT_TIMEOUT,
             )
             # Initialize Megatron parallel states
             # NOTE: we assume all MegatronEngine has the same parallel strategy.
@@ -261,13 +263,17 @@ class MegatronEngine(TrainEngine):
                 context_parallel_size=self.parallel_strategy.context_parallel_size,
                 expert_model_parallel_size=self.parallel_strategy.expert_parallel_size,
                 expert_tensor_parallel_size=self.parallel_strategy.expert_tensor_parallel_size,
-                distributed_timeout_minutes=int(NCCL_DEFAULT_TIMEOUT.seconds / 60),
+                distributed_timeout_minutes=int(
+                    DIST_GROUP_DEFAULT_TIMEOUT.seconds / 60
+                ),
             )
             # Set megatron model parallel seed
             tensor_parallel.model_parallel_cuda_manual_seed(self.seed)
             self.own_global_group = True
         self.logger = logging.getLogger(f"[Megatron Engine Rank {dist.get_rank()}]")
-        self._parallelism_group = dist.new_group()
+        self._parallelism_group = dist.new_group(
+            timeout=DIST_GROUP_DEFAULT_TIMEOUT, backend=backend
+        )
         self._context_and_model_parallel_group = None
         self._init_context_and_model_parallel_group()
         self.process_group_initialized = True
@@ -289,7 +295,7 @@ class MegatronEngine(TrainEngine):
         for dp_rank, ranks in enumerate(context_and_model_parallel_ranks):
             group = mpu.create_group(
                 ranks,
-                timeout=NCCL_DEFAULT_TIMEOUT,
+                timeout=DIST_GROUP_DEFAULT_TIMEOUT,
                 pg_options=mpu.get_nccl_options("tp-cp-pp", {}),
                 group_desc="CONTEXT_AND_MODEL_PARALLEL_GROUP",
             )
@@ -446,6 +452,7 @@ class MegatronEngine(TrainEngine):
             model.train(mode=mode)
         return self
 
+    @trace_perf("megatron_engine.update_bucket", category="comm")
     def _update_bucket_weights_from_distributed(
         self,
         meta: WeightUpdateMeta,
@@ -495,6 +502,7 @@ class MegatronEngine(TrainEngine):
     ) -> int:
         param = all_gather_param(name, param)
         param = remove_padding(name, param, self.hf_config.vocab_size)
+
         if not self.is_pipeline_parallel_head():
             return buffer_size
 
@@ -509,6 +517,7 @@ class MegatronEngine(TrainEngine):
         buffer_size += param_size
         return buffer_size
 
+    @trace_perf("megatron_engine.update_expert_bucket", category="comm")
     def _update_bucket_expert_weights_from_distributed(
         self,
         meta: WeightUpdateMeta,
@@ -571,7 +580,8 @@ class MegatronEngine(TrainEngine):
             converted_hf_tensors.extend(
                 convert_to_hf(self.tf_config, self.hf_config.model_type, name, param)
             )
-        return self._update_bucket_weights_from_distributed(meta, converted_hf_tensors)
+
+        self._update_bucket_weights_from_distributed(meta, converted_hf_tensors)
 
     def _impl_update_expert_weight_from_distributed(
         self,
@@ -618,11 +628,12 @@ class MegatronEngine(TrainEngine):
                 init_method=f"tcp://{meta.nccl_master_address}:{meta.nccl_master_port}",
                 rank=0,
                 group_name=self.weight_update_group_name,
-                timeout=NCCL_DEFAULT_TIMEOUT,
+                timeout=DIST_GROUP_DEFAULT_TIMEOUT,
             )
 
             fut.result()
 
+    @trace_perf("megatron_engine.update_weights_from_distributed", category="comm")
     def _update_weights_from_distributed(self, meta: WeightUpdateMeta):
         if dist.get_rank() == 0:
             self.rollout_engine.pause_generation()
@@ -680,6 +691,7 @@ class MegatronEngine(TrainEngine):
         dist.barrier(device_ids=[self.device.index])
         current_platform.synchronize()
 
+    @trace_perf("megatron_engine.update_weights_from_disk", category="io")
     def _update_weights_from_disk(self, meta: WeightUpdateMeta):
         fut = Future()
 
@@ -746,34 +758,37 @@ class MegatronEngine(TrainEngine):
         self,
         data: list[dict[str, Any]],
         granularity: int = 1,
-        workflow: RolloutWorkflow | None = None,
-        workflow_builder: Callable | None = None,
-        should_accept: Callable | None = None,
+        workflow: RolloutWorkflow | type[RolloutWorkflow] | str | None = None,
+        workflow_kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """Submit a batch of requests and wait for results.
+
+        This method does not support asynchronous rollout and should be used for offline
+        data collection or debugging, not in production experiments.
+        """
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.rollout_batch(
             data,
             granularity=granularity,
             workflow=workflow,
-            workflow_builder=workflow_builder,
-            should_accept=should_accept,
+            workflow_kwargs=workflow_kwargs,
         )
 
     def prepare_batch(
         self,
         dataloader: StatefulDataLoader,
         granularity: int = 1,
-        workflow: RolloutWorkflow | None = None,
-        workflow_builder: Callable | None = None,
-        should_accept: Callable | None = None,
+        workflow: RolloutWorkflow | type[RolloutWorkflow] | str | None = None,
+        workflow_kwargs: dict[str, Any] | None = None,
+        should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
     ) -> dict[str, Any]:
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.prepare_batch(
             dataloader,
             granularity=granularity,
             workflow=workflow,
-            workflow_builder=workflow_builder,
-            should_accept=should_accept,
+            workflow_kwargs=workflow_kwargs,
+            should_accept_fn=should_accept_fn,
         )
 
     def set_version(self, version: int):
@@ -910,6 +925,7 @@ class MegatronEngine(TrainEngine):
         assert self.lr_scheduler is not None, "LR Scheduler is not initialized."
         self.lr_scheduler.step(1)
 
+    @trace_perf("megatron_engine.train_batch", category="compute")
     def train_batch(
         self,
         input_: dict[str, Any],
@@ -977,7 +993,7 @@ class MegatronEngine(TrainEngine):
             return output, functools.partial(_scaled_loss_fn, orig_input)
 
         forward_backward_func = get_forward_backward_func()
-        with perf_tracer.trace_scope("megatron_engine.train_batch.forward_backward"):
+        with trace_scope("megatron_engine.train_batch.forward_backward"):
             data_iterator = (
                 micro_batch_generator
                 if len(self.model) > 1
@@ -992,7 +1008,7 @@ class MegatronEngine(TrainEngine):
                 micro_batch_size=1,  # no use when input_shapes was set
                 forward_only=False,
             )
-        with perf_tracer.trace_scope("megatron_engine.train_batch.step"):
+        with trace_scope("megatron_engine.train_batch.step"):
             update_successful, grad_norm, _ = self.optimizer.step()
         current_lr = self.optimizer.param_groups[0]["lr"]
 
@@ -1002,6 +1018,7 @@ class MegatronEngine(TrainEngine):
             lr=current_lr,
         )
 
+    @trace_perf("megatron_engine.eval_batch", category="compute")
     @torch.no_grad()
     def eval_batch(
         self,
@@ -1064,7 +1081,7 @@ class MegatronEngine(TrainEngine):
             return output, functools.partial(_scaled_loss_fn, orig_input)
 
         forward_backward_func = get_forward_backward_func()
-        with perf_tracer.trace_scope("megatron_engine.eval_batch.forward"):
+        with trace_scope("megatron_engine.eval_batch.forward"):
             data_iterator = (
                 micro_batch_generator
                 if len(self.model) > 1
@@ -1082,6 +1099,7 @@ class MegatronEngine(TrainEngine):
 
         return None
 
+    @trace_perf("megatron_engine.forward", category="compute")
     @torch.no_grad()
     def forward(
         self,
@@ -1142,7 +1160,7 @@ class MegatronEngine(TrainEngine):
 
         forward_backward_func = get_forward_backward_func()
 
-        with perf_tracer.trace_scope("megatron_engine.forward.forward"):
+        with trace_scope("megatron_engine.forward.forward"):
             data_iterator = (
                 micro_batch_generator
                 if len(self.model) > 1

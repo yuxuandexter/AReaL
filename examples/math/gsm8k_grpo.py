@@ -12,9 +12,6 @@ from areal.engine.ppo.actor import FSDPPPOActor
 from areal.engine.sglang_remote import RemoteSGLangEngine
 from areal.platforms import current_platform
 from areal.utils import seeding, stats_tracker
-from areal.utils.data import (
-    cycle_dataloader,
-)
 from areal.utils.dataloader import create_dataloader
 from areal.utils.device import log_gpu_stats
 from areal.utils.evaluator import Evaluator
@@ -142,7 +139,6 @@ def main(args):
     steps_per_epoch = len(train_dataloader)
     max_steps = total_epochs * steps_per_epoch
 
-    data_generator = cycle_dataloader(train_dataloader)
     for global_step in range(start_step, max_steps):
         epoch = global_step // steps_per_epoch
         step = global_step % steps_per_epoch
@@ -154,20 +150,12 @@ def main(args):
         )
 
         with stats_tracker.record_timing("rollout"):
-            if config.async_training:
-                batch = actor.prepare_batch(
-                    train_dataloader,
-                    granularity=actor.config.group_size,
-                    workflow=workflow,
-                    should_accept=lambda sample: True,
-                )
-            else:
-                batch = actor.rollout_batch(
-                    next(data_generator),
-                    granularity=actor.config.group_size,
-                    workflow=workflow,
-                    should_accept=lambda sample: True,
-                )
+            batch = actor.prepare_batch(
+                train_dataloader,
+                granularity=actor.config.group_size,
+                workflow=workflow,
+                should_accept_fn=lambda sample: True,
+            )
 
         if config.actor.recompute_logprob or config.actor.use_decoupled_loss:
             with stats_tracker.record_timing("recompute_logp"):
@@ -184,11 +172,8 @@ def main(args):
             actor.compute_advantages(batch)
             log_gpu_stats("compute advantages")
 
-        with (
-            stats_tracker.record_timing("train_step"),
-            stats_tracker.scope("grpo_actor"),
-        ):
-            stats = actor.ppo_update(batch)
+        with stats_tracker.record_timing("train_step"):
+            actor.ppo_update(batch)
             actor.step_lr_scheduler()
             log_gpu_stats("ppo update")
 
@@ -243,9 +228,7 @@ def main(args):
         current_platform.synchronize()
 
         # Upload statistics to the logger (e.g., wandb)
-        stats[0].update(
-            stats_tracker.export_all(reduce_group=actor.data_parallel_group)
-        )
+        stats = stats_tracker.export_all(reduce_group=actor.data_parallel_group)
         stats_logger.commit(epoch, step, global_step, stats)
 
         dist.barrier(device_ids=[actor.device.index])

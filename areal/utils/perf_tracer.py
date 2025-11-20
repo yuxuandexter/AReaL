@@ -1,29 +1,77 @@
 from __future__ import annotations
 
+import asyncio
 import atexit
+import functools
 import getpass
 import json
 import os
 import threading
 import time
-from contextlib import (
-    AbstractAsyncContextManager,
-    AbstractContextManager,
-)
-from dataclasses import dataclass
+import warnings
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager, AbstractContextManager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, ClassVar, cast
 
-from areal.api.cli_args import PerfTracerConfig, RequestTracerConfig
+from areal.api.cli_args import PerfTracerConfig, SessionTracerConfig
 from areal.utils import logging
 
 logger = logging.getLogger("PerfTracer")
+
+# Context variable for storing task_id in async context
+_current_task_id: ContextVar[int | None] = ContextVar("task_id", default=None)
+
+# Context variable for storing session_id in async context
+_current_session_id: ContextVar[int | None] = ContextVar("session_id", default=None)
+
+# Suppress Pydantic warnings for standard dataclasses
+# Pydantic may inspect all dataclasses even when not using pydantic.dataclasses
+# and emit false warnings about field() parameters or frozen dataclasses
+warnings.filterwarnings(
+    "ignore",
+    message=".*repr.*should be.*",
+    category=UserWarning,
+    module="pydantic",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=".*frozen.*attribute.*provided to.*Field.*function.*",
+    category=UserWarning,
+    module="pydantic",
+)
 
 
 _THREAD_LOCAL = threading.local()
 
 
 class PerfTraceCategory(str, Enum):
+    """Categories for classifying performance trace events.
+
+    These categories help organize and filter trace events in visualization tools
+    like Perfetto or Chrome Tracing. Categories are used in @trace_perf decorators,
+    trace_scope context managers, and instant markers.
+
+    Attributes
+    ----------
+    COMPUTE : str
+        CPU/GPU computation (forward pass, backward pass, loss calculation).
+    COMM : str
+        Distributed communication (all-reduce, broadcast, point-to-point).
+    IO : str
+        Disk I/O operations (checkpoint save/load, data loading).
+    SYNC : str
+        Synchronization barriers and locks.
+    SCHEDULER : str
+        Task scheduling and queue management.
+    INSTR : str
+        Instrumentation and profiling overhead.
+    MISC : str
+        Miscellaneous events that don't fit other categories.
+    """
+
     COMPUTE = "compute"
     COMM = "comm"
     IO = "io"
@@ -55,7 +103,28 @@ _CATEGORY_ALIASES: dict[str, PerfTraceCategory] = {
 
 
 _PERF_TRACE_FILENAME = "traces.jsonl"
-_REQUEST_TRACE_FILENAME = "requests.jsonl"
+_SESSION_TRACE_FILENAME = "sessions.jsonl"
+
+
+class _NullContext(AbstractContextManager, AbstractAsyncContextManager):
+    """No-op context manager returned when tracing is disabled.
+
+    Provides both sync and async context manager interfaces that do nothing,
+    allowing trace_scope and atrace_scope to be called unconditionally without
+    overhead when tracing is disabled or session_id is None.
+    """
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, exc_tb):
+        return False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, exc_tb):
+        return False
 
 
 def _rank_qualified_filename(filename: str, rank: int) -> str:
@@ -73,7 +142,35 @@ def _normalize_save_interval(config: PerfTracerConfig) -> int:
     return max(config.save_interval, 1)
 
 
+def _normalize_flush_threshold(config: SessionTracerConfig) -> int:
+    try:
+        value = int(config.flush_threshold)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid flush_threshold=%r; defaulting to 1",
+            getattr(config, "flush_threshold", None),
+        )
+        return 1
+    return max(value, 1)
+
+
 def _normalize_category(category: CategoryLike) -> str:
+    """Normalize a category specification to a standard string value.
+
+    Converts various category representations (enum, string, aliases) to their
+    canonical string values. Returns "misc" for None or invalid inputs.
+
+    Parameters
+    ----------
+    category : CategoryLike
+        Category as PerfTraceCategory enum, string, or None.
+
+    Returns
+    -------
+    str
+        Normalized category string value.
+    """
+
     if category is None:
         return PerfTraceCategory.MISC.value
     if isinstance(category, PerfTraceCategory):
@@ -94,6 +191,28 @@ def _default_trace_path(
     filename: str = _PERF_TRACE_FILENAME,
     subdir: str | None = None,
 ) -> str:
+    """Generate the default output path for trace files.
+
+    Constructs a standardized path under fileroot/logs/user/experiment/trial/
+    with rank-qualified filename. Used for both performance traces and session traces.
+
+    Parameters
+    ----------
+    config : PerfTracerConfig
+        Configuration containing fileroot, experiment_name, and trial_name.
+    rank : int
+        Rank identifier to include in filename.
+    filename : str, default="traces.jsonl"
+        Base filename before rank qualification.
+    subdir : str | None, default=None
+        Optional subdirectory under trial_name (e.g., "perf_tracer", "session_tracer").
+
+    Returns
+    -------
+    str
+        Absolute path to the trace output file.
+    """
+
     base_dir = os.path.join(
         os.path.expanduser(os.path.expandvars(config.fileroot)),
         "logs",
@@ -106,80 +225,719 @@ def _default_trace_path(
     return os.path.join(base_dir, _rank_qualified_filename(filename, rank))
 
 
-def _normalize_flush_threshold(config: RequestTracerConfig) -> int:
-    return max(config.flush_threshold, 1)
+class SessionTraceEvent(str, Enum):
+    """Enumeration of lifecycle events for session tracking.
 
+    These events represent key points in a session's lifecycle and are used to
+    trigger state updates, timestamp recording, and metric computation. Events
+    are typically recorded via trace_session_event() or through context managers
+    like atrace_session_phase().
 
-def _staleness_to_dict(stats: Any) -> dict[str, int] | None:
-    if stats is None:
-        return None
-    if isinstance(stats, dict):
-        return {
-            "submitted": int(stats.get("submitted", 0)),
-            "running": int(stats.get("running", 0)),
-            "accepted": int(stats.get("accepted", 0)),
-        }
-    submitted = getattr(stats, "submitted", None)
-    running = getattr(stats, "running", None)
-    accepted = getattr(stats, "accepted", None)
-    if submitted is None and running is None and accepted is None:
-        return None
-    return {
-        "submitted": int(submitted or 0),
-        "running": int(running or 0),
-        "accepted": int(accepted or 0),
-    }
+    Event categories:
+    - Phase boundaries: GENERATE_START, GENERATE_END, REWARD_START, REWARD_END,
+                       TOOLCALL_START, TOOLCALL_END
+
+    The events map to SessionRecord state transitions and are bound to specific
+    actions through EventBinding configurations in SessionRecord.build_event_rules().
+
+    Attributes
+    ----------
+    FINALIZED : str
+        Session has been finalized.
+    GENERATE_START : str
+        Generation phase has started within the workflow.
+    GENERATE_END : str
+        Generation phase has completed.
+    REWARD_START : str
+        Reward computation phase has started.
+    REWARD_END : str
+        Reward computation phase has completed.
+    TOOLCALL_START : str
+        Tool calling phase has started.
+    TOOLCALL_END : str
+        Tool calling phase has completed.
+
+    See Also
+    --------
+    trace_session_event : Function to record these events
+    SessionRecord : Class that processes these events
+    EventBinding : Configuration for event handling
+    """
+
+    # Lifecycle markers
+    FINALIZED = "finalized"
+
+    # Phase boundaries
+    GENERATE_START = "generate_start"
+    GENERATE_END = "generate_end"
+    REWARD_START = "reward_start"
+    REWARD_END = "reward_end"
+    TOOLCALL_START = "toolcall_start"
+    TOOLCALL_END = "toolcall_end"
 
 
 @dataclass
-class RequestRecord:
-    request_id: int
+class PhaseSpan:
+    """Represents a single execution of a phase with start and end timestamps.
+
+    A phase may execute multiple times within a session (e.g., multiple generate calls),
+    and each execution is tracked as a separate PhaseSpan.
+
+    Attributes
+    ----------
+    start_ts : float
+        Timestamp when the phase started (from time.time(), wall-clock time).
+    end_ts : float | None
+        Timestamp when the phase ended, or None if still in progress.
+    """
+
+    start_ts: float
+    end_ts: float | None = None
+
+    def to_dict(self) -> dict[str, float | None]:
+        return {
+            "start_ts": self.start_ts,
+            "end_ts": self.end_ts,
+        }
+
+
+# NOTE: frozen=True is valid despite Pydantic warnings
+@dataclass(frozen=True)
+class PhaseSpec:
+    """Configuration specification for a tracked phase in session lifecycle.
+
+    Defines how a phase should be tracked, including which events mark its boundaries,
+    whether multiple executions are allowed, and optional callbacks for state updates.
+
+    Attributes
+    ----------
+    name : str
+        Phase name (e.g., "generate", "reward", "execution").
+    start_event : SessionTraceEvent
+        Event that marks the start of this phase.
+    end_event : SessionTraceEvent
+        Event that marks the end of this phase.
+    allow_multiple : bool, default=False
+        Whether this phase can execute multiple times within a session.
+    ready_on_complete : bool, default=False
+        Whether session becomes ready for flushing when this phase completes.
+    on_end : Callable | None, default=None
+        Optional callback invoked when the phase ends for custom state updates.
+    """
+
+    name: str
+    start_event: SessionTraceEvent
+    end_event: SessionTraceEvent
+    allow_multiple: bool = False
+    ready_on_complete: bool = False
+    on_end: Callable[[SessionRecord, dict[str, Any]], None] | None = None
+
+
+# NOTE: frozen=True is valid despite Pydantic warnings
+@dataclass(frozen=True)
+class EventBinding:
+    """Binding configuration for how a SessionTraceEvent updates SessionRecord state.
+
+    Defines the actions to take when a specific event is recorded, such as updating
+    timestamps, starting/ending phases, invoking callbacks, or marking readiness.
+
+    Attributes
+    ----------
+    timestamp_attr : str | None, default=None
+        SessionRecord attribute to update with event timestamp (e.g., "finalized_ts").
+    phase : str | None, default=None
+        Phase name to update if this event represents a phase boundary.
+    role : str | None, default=None
+        Phase role: "start" or "end" for phase boundary events.
+    allow_multiple : bool, default=False
+        Whether multiple executions of this phase are allowed.
+    payload_handler : Callable | None, default=None
+        Optional callback to process event payload and update record state.
+    mark_ready : bool, default=False
+        Whether this event marks the session as ready for flushing.
+    """
+
+    timestamp_attr: str | None = None
+    phase: str | None = None
+    role: str | None = None
+    allow_multiple: bool = False
+    payload_handler: Callable[[SessionRecord, dict[str, Any]], None] | None = None
+    mark_ready: bool = False
+
+
+# NOTE: frozen=True is valid despite Pydantic warnings
+@dataclass(frozen=True)
+class FieldSpec:
+    """Specification for serializing a field from SessionRecord to JSON output.
+
+    Defines how to extract or compute a value from a SessionRecord for inclusion
+    in the serialized output. Can either read a direct attribute or invoke a
+    computation function for derived metrics.
+
+    Attributes
+    ----------
+    attr : str | None, default=None
+        SessionRecord attribute name to read directly (e.g., "session_id", "status").
+    key : str | None, default=None
+        JSON key name in output. Defaults to attr if not specified.
+    compute : Callable | None, default=None
+        Function to compute derived value from SessionRecord (e.g., duration calculation).
+    omit_if_none : bool, default=True
+        Whether to omit this field from JSON if its value is None.
+    """
+
+    attr: str | None = None
+    key: str | None = None
+    compute: Callable[[SessionRecord], Any] | None = None
+    omit_if_none: bool = True
+
+    def resolve(self, record: SessionRecord) -> Any:
+        if self.compute is not None:
+            return self.compute(record)
+        if self.attr is None:
+            raise ValueError("RecordField requires either attr or compute")
+        return getattr(record, self.attr)
+
+    def key_name(self) -> str:
+        if self.key is not None:
+            return self.key
+        if self.attr is None:
+            raise ValueError("RecordField without attr must define key")
+        return self.attr
+
+
+@dataclass
+class SessionRecord:
+    """Record of a single session's lifecycle with timestamps and computed metrics.
+
+    This class represents the complete execution trace of a rollout session, including
+    all lifecycle events, phase executions, and derived performance metrics. It serves
+    as both an in-memory state tracker during execution and the serialization format
+    for persisted session traces.
+
+    The record tracks three main aspects:
+    1. Lifecycle timestamps: submission (submit_ts) and finalization (finalized_ts)
+    2. Phase executions: generate and reward phases with start/end times, supporting
+       multiple executions per phase
+    3. Derived metrics: computed from timestamps (total_s, generate_s, reward_s)
+
+    State management:
+    - Starts with status="pending" on registration
+    - Updates to "accepted", "rejected", "failed", or "dropped" based on execution
+    - Becomes ready for flushing when reaching a terminal state or explicit completion
+    - Tracks multiple executions of phases (e.g., multiple generate calls in one session)
+
+    The class uses ClassVar configurations (PHASE_CONFIGS, FIELD_SPECS) to define:
+    - Which phases to track and their event bindings
+    - Which fields to serialize and how to compute derived values
+    - Lifecycle event handling and state transitions
+
+    Parameters
+    ----------
+    task_id : int
+        Identifier for the task associated with this session.
+    session_id : int
+        Unique identifier for this session.
+    rank : int
+        Rank identifier for the process that created this session.
+    submit_ts : float
+        Timestamp when the session was submitted (from time.time(), wall-clock time).
+    status : str, default="pending"
+        Current status: "pending", "accepted", "rejected", "failed", or "dropped".
+    reason : str | None, default=None
+        Reason for rejection if status is "rejected" or "dropped".
+    finalized_ts : float | None, default=None
+        Timestamp when the session result was finalized by the training loop.
+
+    See Also
+    --------
+    SessionTracer : Manager that creates and tracks SessionRecord instances
+    PhaseSpan : Represents a single phase execution with start/end timestamps
+    PhaseSpec : Configuration for tracked phases and their events
+    """
+
+    task_id: int
+    session_id: int
     rank: int
     submit_ts: float
-    enqueue_ts: float | None = None
-    execute_start_ts: float | None = None
-    execute_end_ts: float | None = None
-    wait_return_ts: float | None = None
     status: str = "pending"
-    should_accept: bool | None = None
-    rejection_reason: str | None = None
-    staleness: dict[str, int] | None = None
+    reason: str | None = None
+    finalized_ts: float | None = None
+    phases: dict[str, list[PhaseSpan]] = field(init=False)
+    counters: dict[str, int] = field(init=False)
+    # NOTE: repr=False is valid for dataclasses.field() despite Pydantic warnings
+    _active_phases: dict[str, PhaseSpan | None] = field(init=False, repr=False)
+
+    PHASE_CONFIGS: ClassVar[tuple[PhaseSpec, ...]] = ()
+    COUNTERS: ClassVar[tuple[str, ...]] = ()
+    FIELD_SPECS: ClassVar[tuple[FieldSpec, ...]] = ()
+
+    def __post_init__(self) -> None:
+        self.phases = {cfg.name: [] for cfg in self.PHASE_CONFIGS}
+        self._active_phases = {cfg.name: None for cfg in self.PHASE_CONFIGS}
+        self.counters = {name: 0 for name in self.COUNTERS}
+
+    @classmethod
+    def default_phase_configs(cls) -> tuple[PhaseSpec, ...]:
+        return (
+            PhaseSpec(
+                name="generate",
+                start_event=SessionTraceEvent.GENERATE_START,
+                end_event=SessionTraceEvent.GENERATE_END,
+                allow_multiple=True,
+            ),
+            PhaseSpec(
+                name="reward",
+                start_event=SessionTraceEvent.REWARD_START,
+                end_event=SessionTraceEvent.REWARD_END,
+                allow_multiple=True,
+            ),
+            PhaseSpec(
+                name="toolcall",
+                start_event=SessionTraceEvent.TOOLCALL_START,
+                end_event=SessionTraceEvent.TOOLCALL_END,
+                allow_multiple=True,
+            ),
+        )
 
     def is_ready_to_flush(self) -> bool:
         if self.status in {"rejected", "failed", "dropped"}:
             return True
-        if self.status == "accepted" and self.wait_return_ts is not None:
+        if self.status == "accepted" and self.finalized_ts is not None:
             return True
         return False
 
-    def to_dict(self) -> dict[str, Any]:
-        data: dict[str, Any] = {
-            "request_id": self.request_id,
-            "rank": self.rank,
-            "status": self.status,
-            "should_accept": self.should_accept,
-            "rejection_reason": self.rejection_reason,
-            "submit_ts": self.submit_ts,
-            "enqueue_ts": self.enqueue_ts,
-            "execute_start_ts": self.execute_start_ts,
-            "execute_end_ts": self.execute_end_ts,
-            "wait_return_ts": self.wait_return_ts,
-            "staleness": self.staleness,
+    def increment_counter(self, name: str, value: int = 1) -> None:
+        self.counters[name] = self.counters.get(name, 0) + value
+
+    def apply_phase_event(
+        self,
+        phase: str,
+        role: str,
+        timestamp: float,
+        *,
+        allow_multiple: bool,
+    ) -> None:
+        entries = self.phases.setdefault(phase, [])
+        current = self._active_phases.get(phase)
+        if role == "start":
+            if current is not None and current.end_ts is None and not allow_multiple:
+                current.end_ts = timestamp
+            entry = PhaseSpan(start_ts=timestamp)
+            entries.append(entry)
+            self._active_phases[phase] = entry
+        elif role == "end":
+            if current is None or current.end_ts is not None:
+                entry = PhaseSpan(start_ts=timestamp)
+                entries.append(entry)
+            else:
+                entry = current
+            entry.end_ts = timestamp
+            self._active_phases[phase] = None
+
+    @staticmethod
+    def _on_finalized(record: SessionRecord, payload: dict[str, Any]) -> None:
+        """Handle terminal event for a session."""
+        status = payload.get("status")
+        if status is not None:
+            record.status = status
+        if "reason" in payload:
+            record.reason = payload.get("reason")
+
+    @classmethod
+    def build_event_rules(cls) -> dict[SessionTraceEvent, EventBinding]:
+        rules: dict[SessionTraceEvent, EventBinding] = {
+            # FINALIZED is the canonical terminal event for a session; it
+            # records the wait/return timestamp and invokes the unified
+            # termination handler to set final status.
+            SessionTraceEvent.FINALIZED: EventBinding(
+                timestamp_attr="finalized_ts",
+                payload_handler=cls._on_finalized,
+                mark_ready=True,
+            ),
         }
-        data["queue_wait_s"] = _maybe_duration(self.submit_ts, self.enqueue_ts)
-        data["runner_wait_s"] = _maybe_duration(self.enqueue_ts, self.execute_start_ts)
-        data["execution_s"] = _maybe_duration(
-            self.execute_start_ts, self.execute_end_ts
+        for cfg in cls.PHASE_CONFIGS:
+            rules[cfg.start_event] = EventBinding(
+                phase=cfg.name,
+                role="start",
+                allow_multiple=cfg.allow_multiple,
+            )
+            if cfg.end_event is not None:
+                rules[cfg.end_event] = EventBinding(
+                    phase=cfg.name,
+                    role="end",
+                    payload_handler=cfg.on_end,
+                    mark_ready=cfg.ready_on_complete,
+                )
+        return rules
+
+    def _phase_total_duration(self, phase: str) -> float | None:
+        durations = [
+            entry.end_ts - entry.start_ts
+            for entry in self.phases.get(phase, [])
+            if entry.end_ts is not None
+        ]
+        if not durations:
+            return None
+        return sum(durations)
+
+    @staticmethod
+    def _compute_total_time(record: SessionRecord) -> float | None:
+        return _maybe_duration(record.submit_ts, record.finalized_ts)
+
+    @staticmethod
+    def _compute_generate_time(record: SessionRecord) -> float | None:
+        return record._phase_total_duration("generate")
+
+    @staticmethod
+    def _compute_reward_time(record: SessionRecord) -> float | None:
+        return record._phase_total_duration("reward")
+
+    @staticmethod
+    def _compute_toolcall_time(record: SessionRecord) -> float | None:
+        return record._phase_total_duration("toolcall")
+
+    @classmethod
+    def default_field_specs(cls) -> tuple[FieldSpec, ...]:
+        return (
+            FieldSpec("task_id"),
+            FieldSpec("session_id"),
+            FieldSpec("rank"),
+            FieldSpec("status"),
+            FieldSpec("reason", omit_if_none=True),
+            FieldSpec("submit_ts"),
+            FieldSpec("finalized_ts", omit_if_none=True),
+            FieldSpec(
+                compute=cls._compute_total_time,
+                key="total_s",
+                omit_if_none=True,
+            ),
+            FieldSpec(
+                compute=cls._compute_generate_time,
+                key="generate_s",
+                omit_if_none=True,
+            ),
+            FieldSpec(
+                compute=cls._compute_reward_time,
+                key="reward_s",
+                omit_if_none=True,
+            ),
+            FieldSpec(
+                compute=cls._compute_toolcall_time,
+                key="toolcall_s",
+                omit_if_none=True,
+            ),
         )
-        data["post_wait_s"] = _maybe_duration(self.execute_end_ts, self.wait_return_ts)
-        data["total_s"] = _maybe_duration(self.submit_ts, self.wait_return_ts)
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {}
+        for field_spec in self.FIELD_SPECS:
+            value = field_spec.resolve(self)
+            if field_spec.omit_if_none and value is None:
+                continue
+            data[field_spec.key_name()] = value
+        if any(self.phases.values()):
+            data["phases"] = {
+                name: [entry.to_dict() for entry in entries]
+                for name, entries in self.phases.items()
+                if entries
+            }
+        if any(self.counters.values()):
+            data["counters"] = {k: v for k, v in self.counters.items() if v}
         return data
 
 
-class RequestTracer:
+SessionRecord.PHASE_CONFIGS = SessionRecord.default_phase_configs()
+SessionRecord.FIELD_SPECS = SessionRecord.default_field_specs()
+_SESSION_EVENT_RULES = SessionRecord.build_event_rules()
+
+_SESSION_TRACE_METHOD_TO_EVENT: dict[str, SessionTraceEvent] = {
+    "mark_finalized": SessionTraceEvent.FINALIZED,
+    "mark_generate_start": SessionTraceEvent.GENERATE_START,
+    "mark_generate_end": SessionTraceEvent.GENERATE_END,
+    "mark_reward_start": SessionTraceEvent.REWARD_START,
+    "mark_reward_end": SessionTraceEvent.REWARD_END,
+    "mark_toolcall_start": SessionTraceEvent.TOOLCALL_START,
+    "mark_toolcall_end": SessionTraceEvent.TOOLCALL_END,
+}
+
+
+def trace_session_event(
+    method: str,
+    session_id: int | None = None,
+    task_id: int | None = None,
+    **payload: Any,
+) -> None:
+    """Record a session lifecycle event for tracking.
+
+    This is the primary function for recording session events. It routes the event
+    to the global SessionTracer (if configured) and applies appropriate state updates
+    to the corresponding SessionRecord.
+
+    The function handles two types of operations:
+    1. Counter increments: method="increment_counter" with name and value in payload
+    2. Lifecycle events: method mapped to SessionTraceEvent enum values
+
+    Parameters
+    ----------
+    method : str
+        Event method name. Standard methods: "mark_finalized", "mark_generate_start",
+        "mark_generate_end", "mark_reward_start", "mark_reward_end", "increment_counter".
+    session_id : int | None, Optional
+        Optional session ID to record the event for.
+    task_id : int | None, optional
+        Optional task identifier associated with the session.
+    **payload : Any
+        Additional event data. Common keys include "status", "reason"
+        for execution_end events, and "name", "value" for counters.
+
+    See Also
+    --------
+    SessionTraceEvent : Enum defining available lifecycle events
+    trace_session_phase : Context manager for automatic phase start/end pairing
+    atrace_session_phase : Async version of trace_session_phase
+    """
+
+    tracer = get_session_tracer()
+    if tracer is None:
+        return
+    if session_id is not None:
+        session_ids = [session_id]
+    elif task_id is not None:
+        session_ids = tracer.get_session_ids(task_id)
+    else:
+        return
+    if method == "increment_counter":
+        name = payload.get("name")
+        if not name:
+            return
+        for session_id in session_ids:
+            tracer.increment_counter(session_id, name, payload.get("value", 1))
+        return
+    event = _SESSION_TRACE_METHOD_TO_EVENT.get(method)
+    if event is None:
+        return
+    for session_id in session_ids:
+        tracer.record_event(session_id, event, **payload)
+
+
+class _SyncSessionPhaseScope(AbstractContextManager[Any]):
+    """Sync context manager for tracing session phases.
+
+    Automatically calls mark_{phase}_start on enter and mark_{phase}_end on exit,
+    ensuring proper pairing even if exceptions occur.
+    """
+
     def __init__(
         self,
-        config: RequestTracerConfig,
+        session_id: int | None,
+        phase: str,
+        *,
+        start_payload: dict[str, Any] | None = None,
+        end_payload: dict[str, Any] | None = None,
+    ) -> None:
+        self._session_id = session_id
+        self._phase = phase
+        self._start_method = f"mark_{phase}_start"
+        self._end_method = f"mark_{phase}_end"
+        self._start_payload = start_payload or {}
+        self._end_payload = end_payload or {}
+
+    def __enter__(self) -> _SyncSessionPhaseScope:
+        trace_session_event(
+            self._start_method, session_id=self._session_id, **self._start_payload
+        )
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Always call end event, even if exception occurred
+        trace_session_event(
+            self._end_method, session_id=self._session_id, **self._end_payload
+        )
+        return False  # Don't suppress exceptions
+
+
+class _AsyncSessionPhaseScope(AbstractAsyncContextManager[Any]):
+    """Async context manager for tracing session phases.
+
+    Automatically calls mark_{phase}_start on enter and mark_{phase}_end on exit,
+    ensuring proper pairing even if exceptions occur.
+    """
+
+    def __init__(
+        self,
+        session_id: int | None,
+        phase: str,
+        *,
+        start_payload: dict[str, Any] | None = None,
+        end_payload: dict[str, Any] | None = None,
+    ) -> None:
+        self._session_id = session_id
+        self._phase = phase
+        self._start_method = f"mark_{phase}_start"
+        self._end_method = f"mark_{phase}_end"
+        self._start_payload = start_payload or {}
+        self._end_payload = end_payload or {}
+
+    async def __aenter__(self) -> _AsyncSessionPhaseScope:
+        trace_session_event(
+            self._start_method, session_id=self._session_id, **self._start_payload
+        )
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        # Always call end event, even if exception occurred
+        trace_session_event(
+            self._end_method, session_id=self._session_id, **self._end_payload
+        )
+        return False  # Don't suppress exceptions
+
+
+def trace_session_phase(
+    phase: str,
+    *,
+    start_payload: dict[str, Any] | None = None,
+    end_payload: dict[str, Any] | None = None,
+) -> AbstractContextManager[Any]:
+    """Sync context manager for tracing session phases.
+
+    Automatically pairs mark_{phase}_start and mark_{phase}_end events,
+    ensuring they are always called together even if exceptions occur.
+
+    Parameters
+    ----------
+    phase : str
+        Phase name (e.g., "generate", "reward", "execution").
+        Will call ``mark_{phase}_start`` and ``mark_{phase}_end``.
+    start_payload : dict[str, Any] | None
+        Optional payload to pass to the start event.
+    end_payload : dict[str, Any] | None
+        Optional payload to pass to the end event.
+
+    Returns
+    -------
+    AbstractContextManager
+        A sync context manager for the phase tracing.
+
+    Examples
+    --------
+    >>> with trace_session_phase("generate"):
+    ...     result = engine.generate(req)
+
+    >>> with trace_session_phase("reward"):
+    ...     reward = reward_fn(prompt, completion)
+
+    >>> with trace_session_phase(
+    ...     "execution",
+    ...     end_payload={"status": "accepted"}
+    ... ):
+    ...     result = process_request()
+    """
+    session_id = get_session_id()
+
+    if session_id is None:
+        return _NullContext()
+    return _SyncSessionPhaseScope(
+        session_id,
+        phase,
+        start_payload=start_payload,
+        end_payload=end_payload,
+    )
+
+
+def atrace_session_phase(
+    phase: str,
+    *,
+    start_payload: dict[str, Any] | None = None,
+    end_payload: dict[str, Any] | None = None,
+) -> AbstractAsyncContextManager[Any]:
+    """Async context manager for tracing session phases.
+
+    Automatically pairs mark_{phase}_start and mark_{phase}_end events,
+    ensuring they are always called together even if exceptions occur.
+
+    Parameters
+    ----------
+    phase : str
+        Phase name (e.g., "generate", "reward").
+        Will call ``mark_{phase}_start`` and ``mark_{phase}_end``.
+    start_payload : dict[str, Any] | None
+        Optional payload to pass to the start event.
+    end_payload : dict[str, Any] | None
+        Optional payload to pass to the end event.
+
+    Returns
+    -------
+    AbstractAsyncContextManager
+        An async context manager for the phase tracing.
+
+    Examples
+    --------
+    >>> async with atrace_session_phase("generate"):
+    ...     result = await engine.agenerate(req)
+
+    >>> async with atrace_session_phase("reward"):
+    ...     reward = await reward_fn(prompt, completion)
+
+    >>> async with atrace_session_phase(
+    ...     "execution",
+    ...     end_payload={"status": "accepted"}
+    ... ):
+    ...     result = await process_request()
+    """
+    session_id = get_session_id()
+
+    if session_id is None:
+        return _NullContext()
+    return _AsyncSessionPhaseScope(
+        session_id,
+        phase,
+        start_payload=start_payload,
+        end_payload=end_payload,
+    )
+
+
+class SessionTracer:
+    """Tracer for tracking per-session lifecycle events and computing derived metrics.
+
+    This class manages the complete lifecycle of individual rollout sessions, from
+    submission through finalization. It records timestamped events, tracks phase
+    executions (generate, reward, etc.), and computes derived metrics like total
+    latency and per-phase durations.
+
+    The tracer automatically flushes completed sessions to disk in JSONL format
+    when the flush threshold is reached or when explicitly requested. Each session
+    record includes lifecycle timestamps, status information, phase breakdowns,
+    and computed performance metrics.
+
+    Key features:
+    - Automatic task ID and session ID assignment on registration
+    - Event-driven state updates with timestamp tracking
+    - Phase execution tracking with support for multiple executions per phase
+    - Derived metric computation (total_s, generate_s, reward_s, etc.)
+    - Configurable flush threshold for batched I/O
+    - Thread-safe operation with internal locking
+    - Task-session hierarchy tracking (one task can have multiple sessions)
+
+    Parameters
+    ----------
+    config : SessionTracerConfig
+        Configuration for session tracing including flush threshold settings.
+    output_path : str
+        Absolute path to the output JSONL file where session records will be written.
+    rank : int
+        Rank identifier for this process in distributed training.
+
+    See Also
+    --------
+    SessionRecord : Data structure representing a single session's lifecycle
+    PerfTracer : Main tracer that optionally includes session tracking
+    trace_session_event : Function to record session lifecycle events
+    """
+
+    def __init__(
+        self,
+        config: SessionTracerConfig,
         *,
         output_path: str,
         rank: int,
@@ -187,93 +945,102 @@ class RequestTracer:
         self._config = config
         self._rank = rank
         self._lock = threading.Lock()
-        self._next_id = 0
-        self._records: dict[int, RequestRecord] = {}
+        self._next_task_id = 0
+        self._next_session_id = 0
+        # task id sequence and mapping from task_id -> set(session_id)
+        self._task_to_sessions: dict[int, set[int]] = {}
+        self._records: dict[int, SessionRecord] = {}
         self._ready: set[int] = set()
         self._flush_threshold = _normalize_flush_threshold(config)
         self._output_path = output_path
+        self._event_rules = _SESSION_EVENT_RULES
 
-    def register_submission(self) -> int:
-        now = time.perf_counter()
+    def register_task(self) -> int:
+        """Register a new logical task (dataset-level) and return a task_id.
+
+        Tasks group multiple sessions (one per generated sample). Use
+        :meth:`register_session` to create sessions that belong to a task.
+        """
         with self._lock:
-            request_id = self._next_id
-            self._next_id += 1
-            self._records[request_id] = RequestRecord(
-                request_id=request_id,
+            task_id = self._next_task_id
+            self._next_task_id += 1
+            self._task_to_sessions.setdefault(task_id, set())
+        return task_id
+
+    def register_session(self, task_id: int) -> int:
+        """Register a new session and optionally associate it with a task.
+
+        Returns the newly-created session_id.
+        """
+        now = time.time()
+        with self._lock:
+            session_id = self._next_session_id
+            self._next_session_id += 1
+            self._records[session_id] = SessionRecord(
+                task_id=task_id,
+                session_id=session_id,
                 rank=self._rank,
                 submit_ts=now,
             )
-        return request_id
+            self._task_to_sessions.setdefault(task_id, set()).add(session_id)
+        return session_id
 
-    def mark_enqueued(self, request_id: int) -> None:
+    def get_session_ids(self, task_id: int) -> list[int]:
+        """Get all session IDs associated with the given task_id."""
         with self._lock:
-            record = self._records.get(request_id)
-            if record is None:
-                return
-            record.enqueue_ts = time.perf_counter()
+            return list(self._task_to_sessions.get(task_id, []))
 
-    def mark_execution_start(self, request_id: int) -> None:
-        with self._lock:
-            record = self._records.get(request_id)
-            if record is None:
-                return
-            record.execute_start_ts = time.perf_counter()
-
-    def mark_execution_end(
+    def _apply_event(
         self,
-        request_id: int,
-        *,
-        status: str,
-        should_accept: bool | None,
-        rejection_reason: str | None = None,
-        staleness: Any = None,
+        session_id: int,
+        event: SessionTraceEvent,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        rule = self._event_rules.get(event)
+        if rule is None:
+            return False
+        data = dict(payload or {})
+        with self._lock:
+            record = self._records.get(session_id)
+            if record is None:
+                return False
+            timestamp = time.time()
+            if rule.timestamp_attr is not None:
+                setattr(record, rule.timestamp_attr, timestamp)
+            if rule.phase is not None and rule.role is not None:
+                record.apply_phase_event(
+                    rule.phase,
+                    rule.role,
+                    timestamp,
+                    allow_multiple=rule.allow_multiple,
+                )
+            if rule.payload_handler is not None:
+                rule.payload_handler(record, data)
+            ready = rule.mark_ready or record.is_ready_to_flush()
+            if ready:
+                self._ready.add(session_id)
+                if len(self._ready) >= self._flush_threshold:
+                    return True
+            return False
+
+    def record_event(
+        self,
+        session_id: int,
+        event: SessionTraceEvent,
+        **payload: Any,
     ) -> None:
-        now = time.perf_counter()
-        should_flush = False
-        with self._lock:
-            record = self._records.get(request_id)
-            if record is None:
-                return
-            record.execute_end_ts = now
-            record.status = status
-            record.should_accept = should_accept
-            record.rejection_reason = rejection_reason
-            record.staleness = _staleness_to_dict(staleness)
-            if record.is_ready_to_flush():
-                self._ready.add(request_id)
-                if len(self._ready) >= self._flush_threshold:
-                    should_flush = True
+        should_flush = self._apply_event(session_id, event, payload)
         if should_flush:
             self.flush()
 
-    def mark_consumed(self, request_id: int) -> None:
-        should_flush = False
+    def increment_counter(self, session_id: int, name: str, value: int = 1) -> None:
         with self._lock:
-            record = self._records.get(request_id)
+            record = self._records.get(session_id)
             if record is None:
                 return
-            record.wait_return_ts = time.perf_counter()
+            record.increment_counter(name, value)
             if record.is_ready_to_flush():
-                self._ready.add(request_id)
-                if len(self._ready) >= self._flush_threshold:
-                    should_flush = True
-        if should_flush:
-            self.flush()
-
-    def mark_dropped(self, request_id: int, reason: str) -> None:
-        should_flush = False
-        with self._lock:
-            record = self._records.get(request_id)
-            if record is None:
-                return
-            record.execute_end_ts = time.perf_counter()
-            record.status = "dropped"
-            record.rejection_reason = reason
-            self._ready.add(request_id)
-            if len(self._ready) >= self._flush_threshold:
-                should_flush = True
-        if should_flush:
-            self.flush()
+                self._ready.add(session_id)
 
     def flush(self, force: bool = False) -> None:
         with self._lock:
@@ -284,23 +1051,23 @@ class RequestTracer:
             if not candidate_ids:
                 return
 
-            to_flush: list[tuple[int, RequestRecord, bool]] = []
-            for request_id in candidate_ids:
-                record = self._records.get(request_id)
+            to_flush: list[tuple[int, SessionRecord, bool]] = []
+            for session_id in candidate_ids:
+                record = self._records.get(session_id)
                 if record is None:
-                    self._ready.discard(request_id)
+                    self._ready.discard(session_id)
                     continue
                 if not force and not record.is_ready_to_flush():
                     continue
-                was_ready = request_id in self._ready
-                to_flush.append((request_id, record, was_ready))
+                was_ready = session_id in self._ready
+                to_flush.append((session_id, record, was_ready))
 
             if not to_flush:
                 return
 
-            for request_id, _, _ in to_flush:
-                self._records.pop(request_id, None)
-                self._ready.discard(request_id)
+            for session_id, _, _ in to_flush:
+                self._records.pop(session_id, None)
+                self._ready.discard(session_id)
 
         try:
             payload = [record.to_dict() for (_, record, _) in to_flush]
@@ -316,40 +1083,34 @@ class RequestTracer:
                 os.fsync(fout.fileno())
         except (OSError, TypeError) as exc:  # pragma: no cover - depends on filesystem
             logger.error(
-                "Failed to append request trace to %s: %s",
+                "Failed to append session trace to %s: %s",
                 self._output_path,
                 exc,
             )
             with self._lock:
-                for request_id, record, was_ready in to_flush:
-                    self._records[request_id] = record
+                for session_id, record, was_ready in to_flush:
+                    self._records[session_id] = record
                     if was_ready:
-                        self._ready.add(request_id)
+                        self._ready.add(session_id)
 
     def reset(self) -> None:
         self.flush(force=True)
         with self._lock:
             self._records.clear()
             self._ready.clear()
-            self._next_id = 0
+            self._next_task_id = 0
+            self._next_session_id = 0
             self._flush_threshold = _normalize_flush_threshold(self._config)
 
 
-class _NullContext(AbstractContextManager, AbstractAsyncContextManager):
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, exc_tb):
-        return False
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, exc_tb):
-        return False
-
-
 class _Scope(AbstractContextManager[Any]):
+    """Internal sync context manager for PerfTracer.trace_scope().
+
+    Automatically records complete events (duration spans) with proper timestamp
+    tracking and exception handling. Captures exception types in the args if an
+    exception occurs during execution.
+    """
+
     def __init__(
         self,
         tracer: PerfTracer,
@@ -386,6 +1147,12 @@ class _Scope(AbstractContextManager[Any]):
 
 
 class _AsyncScope(AbstractAsyncContextManager[Any]):
+    """Internal async context manager for PerfTracer.atrace_scope().
+
+    Wraps _Scope to provide async context manager interface while reusing the
+    same timestamp tracking and event recording logic.
+    """
+
     def __init__(
         self,
         tracer: PerfTracer,
@@ -417,7 +1184,33 @@ def _thread_id() -> int:
 
 
 class PerfTracer:
-    """A lightweight tracer that emits Chrome Trace compatible JSON."""
+    """A lightweight tracer that emits Chrome Trace compatible JSON.
+
+    This is the main tracer class for recording performance events during training
+    and inference. It outputs Chrome Trace format JSON files that can be visualized
+    in chrome://tracing or Perfetto.
+
+    The tracer supports two tracking modes:
+    1. Performance events: Trace scopes, instant events, counters (Chrome Trace format)
+    2. Session lifecycle: Optional per-session tracking via integrated SessionTracer
+
+    When session tracking is enabled (via config.session_tracer.enabled=True), the
+    tracer automatically creates a SessionTracer instance that writes session records
+    to a separate JSONL file. This enables detailed analysis of rollout session
+    lifecycles alongside performance traces.
+
+    Parameters
+    ----------
+    config : PerfTracerConfig
+        Configuration including enable flags, output paths, and session tracer settings.
+    rank : int
+        Rank identifier for this process in distributed training.
+
+    See Also
+    --------
+    SessionTracer : Integrated session lifecycle tracker
+    trace_session_event : Function to record session events
+    """
 
     def __init__(self, config: PerfTracerConfig, *, rank: int) -> None:
         if rank < 0:
@@ -437,8 +1230,8 @@ class PerfTracer:
             subdir="perf_tracer",
         )
         self._save_interval = _normalize_save_interval(config)
-        self._request_tracer: RequestTracer | None = None
-        self._configure_request_tracer(config, rank=rank)
+        self._session_tracer: SessionTracer | None = None
+        self._configure_session_tracer(config, rank=rank)
 
     # ------------------------------------------------------------------
     # Configuration helpers
@@ -450,32 +1243,33 @@ class PerfTracer:
     def set_enabled(self, flag: bool) -> None:
         self._enabled = flag
 
-    def _configure_request_tracer(self, config: PerfTracerConfig, *, rank: int) -> None:
-        request_cfg = getattr(config, "request_tracer", None)
-        enabled = bool(request_cfg and getattr(request_cfg, "enabled", False))
+    def _configure_session_tracer(self, config: PerfTracerConfig, *, rank: int) -> None:
+        session_cfg = getattr(config, "session_tracer", None)
+        enabled = bool(session_cfg and getattr(session_cfg, "enabled", False))
         if enabled:
+            session_cfg = cast(SessionTracerConfig, session_cfg)
             output_path = _default_trace_path(
                 config,
-                filename=_REQUEST_TRACE_FILENAME,
+                filename=_SESSION_TRACE_FILENAME,
                 rank=rank,
-                subdir="request_tracer",
+                subdir="session_tracer",
             )
-            if self._request_tracer is None:
-                self._request_tracer = RequestTracer(
-                    request_cfg,
+            if self._session_tracer is None:
+                self._session_tracer = SessionTracer(
+                    session_cfg,
                     output_path=output_path,
                     rank=rank,
                 )
             else:
-                raise RuntimeError("Request tracer is already configured")
+                raise RuntimeError("Session tracer is already configured")
         else:
-            if self._request_tracer is not None:
-                self._request_tracer.flush(force=True)
-            self._request_tracer = None
+            if self._session_tracer is not None:
+                self._session_tracer.flush(force=True)
+            self._session_tracer = None
 
     @property
-    def request_tracer(self) -> RequestTracer | None:
-        return self._request_tracer
+    def session_tracer(self) -> SessionTracer | None:
+        return self._session_tracer
 
     # ------------------------------------------------------------------
     # Core recording API
@@ -538,8 +1332,8 @@ class PerfTracer:
     # Persistence helpers
     # ------------------------------------------------------------------
     def save(self, *, step: int | None = None, force: bool = False) -> None:
-        if self._request_tracer is not None and force:
-            self._request_tracer.flush(force=True)
+        if self._session_tracer is not None and force:
+            self._session_tracer.flush(force=True)
 
         if not self._enabled:
             return
@@ -581,8 +1375,8 @@ class PerfTracer:
                 self._events[0:0] = events_to_write
 
     def reset(self) -> None:
-        if self._request_tracer is not None:
-            self._request_tracer.reset()
+        if self._session_tracer is not None:
+            self._session_tracer.reset()
         with self._lock:
             self._events = []
             self._thread_meta_emitted = set()
@@ -706,11 +1500,11 @@ def get_tracer() -> PerfTracer:
     return _require_configured_tracer()
 
 
-def get_request_tracer() -> RequestTracer | None:
+def get_session_tracer() -> SessionTracer | None:
     tracer = GLOBAL_TRACER
     if tracer is None:
         return None
-    return tracer.request_tracer
+    return tracer.session_tracer
 
 
 def configure(
@@ -727,9 +1521,9 @@ def configure(
             )
         GLOBAL_TRACER = PerfTracer(config, rank=rank)
         logger.info(
-            "Configured global PerfTracer: enabled=%s, request_tracing=%s, rank=%s",
+            "Configured global PerfTracer: enabled=%s, session_tracing=%s, rank=%s",
             GLOBAL_TRACER.enabled,
-            GLOBAL_TRACER.request_tracer is not None,
+            GLOBAL_TRACER.session_tracer is not None,
             rank,
         )
         return GLOBAL_TRACER
@@ -788,14 +1582,208 @@ def save(*, step: int | None = None, force: bool = False) -> None:
     tracer.save(step=step, force=force)
 
 
+def trace_perf(name: str, *, category: CategoryLike = None):
+    """
+    Decorator for tracing function performance with PerfTracer.
+
+    Automatically creates a trace scope around the entire function execution.
+    Works with both sync and async functions.
+
+    Parameters
+    ----------
+    name : str
+        Trace name to display in the trace viewer.
+    category : CategoryLike, optional
+        Trace category (compute, io, comm, sync, scheduler, etc.).
+
+    Examples
+    --------
+    >>> @trace_perf("ppo_update", category="compute")
+    ... async def update_model(self, batch):
+    ...     loss = compute_loss(batch)
+    ...     loss.backward()
+    ...     return loss
+
+    >>> @trace_perf("save_checkpoint", category="io")
+    ... def save(self, path):
+    ...     torch.save(self.state_dict(), path)
+    """
+
+    def decorator(func):
+        if asyncio.iscoroutinefunction(func):
+
+            @functools.wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                async with atrace_scope(name, category=category):
+                    return await func(*args, **kwargs)
+
+            return async_wrapper
+        else:
+
+            @functools.wraps(func)
+            def sync_wrapper(*args, **kwargs):
+                with trace_scope(name, category=category):
+                    return func(*args, **kwargs)
+
+            return sync_wrapper
+
+    return decorator
+
+
+def set_session_id(session_id: int | None) -> None:
+    """Set the session_id for the current async context."""
+    _current_session_id.set(session_id)
+
+
+def get_session_id() -> int | None:
+    """Get the session_id from the current async context."""
+    return _current_session_id.get()
+
+
+def set_task_id(task_id: int | None) -> None:
+    """Set the task_id for the current async context."""
+    _current_task_id.set(task_id)
+
+
+def get_task_id() -> int | None:
+    """Get the task_id from the current async context."""
+    return _current_task_id.get()
+
+
+def register_task() -> int | None:
+    """Register a new task and return the task_id in the current async context."""
+    task_id = None
+    tracer = get_session_tracer()
+    if tracer is not None:
+        task_id = tracer.register_task()
+    return task_id
+
+
+def register_session(task_id: int) -> int | None:
+    """Register a new session under the given task_id and return the session_id."""
+    session_id = None
+    tracer = get_session_tracer()
+    if tracer is not None:
+        session_id = tracer.register_session(task_id)
+    return session_id
+
+
+def session_context():
+    """Decorator factory that populates ``session_id`` from the active task.
+
+    Each wrapped invocation registers a session when a ``task_id`` exists and
+    records it in the session context for downstream tracing. No cleanup or
+    restoration is performed after execution; if no task is active the session
+    context is set to ``None``.
+
+    Returns
+    -------
+    Callable
+        Decorator applicable to both sync and async callables.
+    """
+
+    def decorator(func):
+        def _activate_session() -> None:
+            task_id = get_task_id()
+            session_id = register_session(task_id) if task_id is not None else None
+            set_session_id(session_id)
+
+        if asyncio.iscoroutinefunction(func):
+
+            @functools.wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                _activate_session()
+                return await func(*args, **kwargs)
+
+            return async_wrapper
+        else:
+
+            @functools.wraps(func)
+            def sync_wrapper(*args, **kwargs):
+                _activate_session()
+                return func(*args, **kwargs)
+
+            return sync_wrapper
+
+    return decorator
+
+
+def trace_session(phase: str):
+    """
+    Decorator for tracing session phases using contextvars.
+
+    Automatically reads the active session from context (populated via
+    :func:`session_context`) and traces the phase execution.
+
+    Parameters
+    ----------
+    phase : str
+        Phase name (e.g., "generate", "reward", "execution").
+        Will call mark_{phase}_start and mark_{phase}_end.
+
+    Examples
+    --------
+    >>> # Context is set by WorkflowExecutor before calling arun_episode
+    >>> async def arun_episode(self, engine, data):
+    ...     # session information is automatically available from context
+    ...     resps = await self._do_generate(engine, req, n_samples)
+    ...     results = await self._compute_rewards(resps)
+    ...     return results
+
+    >>> # Use decorator on methods - no need to pass session_id!
+    >>> @trace_session("generate")
+    ... async def _do_generate(self, engine, req, n_samples):
+    ...     return await asyncio.gather(...)
+
+    >>> @trace_session("reward")
+    ... async def _compute_rewards(self, resps):
+    ...     for resp in resps:
+    ...         reward = await self.async_reward_fn(...)
+    ...     return results
+    """
+
+    def decorator(func):
+        if asyncio.iscoroutinefunction(func):
+
+            @functools.wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                async with atrace_session_phase(phase):
+                    return await func(*args, **kwargs)
+
+            return async_wrapper
+        else:
+
+            @functools.wraps(func)
+            def sync_wrapper(*args, **kwargs):
+                with trace_session_phase(phase):
+                    return func(*args, **kwargs)
+
+            return sync_wrapper
+
+    return decorator
+
+
 __all__ = [
     "PerfTracer",
-    "RequestTracer",
+    "SessionTracer",
     "PerfTraceCategory",
     "Category",
+    "SessionTraceEvent",
+    "trace_session_event",
+    "trace_session_phase",
+    "atrace_session_phase",
+    "trace_perf",
+    "trace_session",
+    "session_context",
+    "set_session_id",
+    "get_session_id",
+    "set_task_id",
+    "get_task_id",
+    "register_task",
+    "register_session",
     "GLOBAL_TRACER",
     "get_tracer",
-    "get_request_tracer",
+    "get_session_tracer",
     "configure",
     "reset",
     "trace_scope",
