@@ -83,17 +83,17 @@ def get_deepscaler_simulation_rl_dataset(
         #     # default to a fixed window when metadata is missing
         #     result["max_new_token_list"] = [3072]
 
-        max_new_token_list = sample.get("max_new_token_list", "[]")
-        if isinstance(max_new_token_list, str):
-            max_new_token_list = json.loads(max_new_token_list)
+        # max_new_token_list = sample.get("max_new_token_list", "[]")
+        # if isinstance(max_new_token_list, str):
+        #     max_new_token_list = json.loads(max_new_token_list)
 
-        if isinstance(max_new_token_list, list) and len(max_new_token_list) > 0:
-            # assert n_samples < len(max_new_token_list), "n_samples must be less than the length of max_new_token_list"
-            result["max_new_token_list"] = max_new_token_list
-        else:
-            logger.warning(
-                "max_new_token_list is not a valid list, using random values"
-            )
+        # if isinstance(max_new_token_list, list) and len(max_new_token_list) > 0:
+        #     # assert n_samples < len(max_new_token_list), "n_samples must be less than the length of max_new_token_list"
+        #     result["max_new_token_list"] = max_new_token_list
+        # else:
+        #     logger.warning(
+        #         "max_new_token_list is not a valid list, using random values"
+        #     )
             # hardcode max_new_token_list to be 10 for tests
             # test sharp distirbution:
             # mean: 3072, std: 1024, 512, 256, max_val: 8192
@@ -101,13 +101,13 @@ def get_deepscaler_simulation_rl_dataset(
             # mean: 6144, std: 2048, 512, 256, max_val: 8192
             # test multi-node long context distribution:
             # mean: 12288, std: 2048, max_val: 16384
-            n_samples = 10
-            mean = 6144
-            std = 2048
-            max_val = 8192
-            result["max_new_token_list"] = sample_max_new_tokens(
-                n=n_samples, mean=mean, std=std, max_val=max_val
-            )
+        n_samples = 10
+        mean = 6144
+        std = 2048
+        max_val = 8192
+        result["max_new_token_list"] = sample_max_new_tokens(
+            n=n_samples, mean=mean, std=std, max_val=max_val
+        )
 
         return result
 

@@ -131,7 +131,10 @@ class DistRolloutCoordinator:
             )
             batch = redist.data
 
-        dist.barrier(device_ids=[current_platform.current_device()])
+        dist.barrier(
+            # group=self.train_engine.parallelism_group,
+            device_ids=[current_platform.current_device()],
+        )
         current_platform.synchronize()
 
         batch = broadcast_tensor_container(
@@ -140,7 +143,10 @@ class DistRolloutCoordinator:
             group=self.train_engine.context_and_model_parallel_group,
         )
 
-        dist.barrier(device_ids=[current_platform.current_device()])
+        dist.barrier(
+            # group=self.train_engine.parallelism_group,
+            device_ids=[current_platform.current_device()],
+        )
         current_platform.synchronize()
 
         return batch

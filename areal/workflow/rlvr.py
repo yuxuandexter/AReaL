@@ -181,6 +181,14 @@ class RLVRWorkflow(RolloutWorkflow):
             expected_lengths.append(None)
         resps = await asyncio.gather(*[engine.agenerate(req) for req in requests])
 
+        # Validate output lengths if simulation was requested
+        if should_simulate_response:
+            for i, (resp, expected_len) in enumerate(zip(resps, expected_lengths)):
+                if expected_len is not None and len(resp.output_tokens) != expected_len:
+                    logger.warning(
+                        f"Sample {i}: Expected {expected_len} tokens, got {len(resp.output_tokens)} tokens. "
+                        f"Stop reason: {resp.stop_reason}"
+                    )
 
         version = engine.get_version()
         prompt_str = self.tokenizer.decode(input_ids)

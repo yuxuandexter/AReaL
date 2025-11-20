@@ -416,6 +416,13 @@ class TrainEngineConfig:
     )
 
     # Training Backend Configuration
+    backend: str = field(
+        default="fsdp",
+        metadata={
+            "help": "Training backend.",
+            "choices": ["fsdp", "megatron"],
+        },
+    )
     disable_dropout: bool = field(
         default=False, metadata={"help": "Disable dropout layers during training"}
     )

@@ -46,6 +46,7 @@ class VLLMBackend:
             "max_tokens": gconfig.max_new_tokens,
             "temperature": 0.0 if gconfig.greedy else gconfig.temperature,
             "stop_token_ids": stop_token_ids,
+            "ignore_eos": gconfig.ignore_eos,
             "return_tokens_as_token_ids": True,
             "logprobs": 0,
             "stream": False,
@@ -151,6 +152,16 @@ class VLLMBackend:
         cmd = vLLMConfig.build_cmd_from_args(server_args)
 
         _env = os.environ.copy()
+        # Increase timeout to avoid "No available shared memory broadcast block" during slow ops (compilation/large transfers)
+        # Set to 5 minutes (300s). Note: vLLM reads this in ms usually if passed as arg, but env var usage varies.
+        # We set both common env vars just in case.
+        # _env["VLLM_RPC_TIMEOUT"] = "300000" 
+        # _env["NCCL_BLOCKING_WAIT"] = "1"
+        # _env["NCCL_ASYNC_ERROR_HANDLING"] = "1"
+        # # Disable P2P to prevent interference between vLLM and Megatron NCCL groups on the same node
+        # _env["NCCL_P2P_DISABLE"] = "1"
+        # _env["NCCL_IB_DISABLE"] = "1"
+
         triton_cache_path = _env.get("TRITON_CACHE_PATH", TRITON_CACHE_PATH)
         _env["TRITON_CACHE_PATH"] = os.path.join(triton_cache_path, str(uuid.uuid4()))
 
