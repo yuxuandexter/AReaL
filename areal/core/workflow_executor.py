@@ -379,7 +379,12 @@ class WorkflowExecutor:
                     try:
                         self.runner.submit(workflow_fn)
 
-                        self.staleness_manager.on_rollout_submitted()
+                        request_length = 0.0
+                        max_new_token_list = task.data.get("max_new_token_list")
+                        if max_new_token_list is not None and len(max_new_token_list) > 0:
+                            request_length = float(sum(max_new_token_list) / len(max_new_token_list))
+
+                        self.staleness_manager.on_rollout_submitted(request_length=request_length)
                         if self.config.enable_rollout_tracing:
                             self.logger.info(f"Submit rollout. {self._rollout_stats()}")
                     except TaskQueueFullError:
@@ -674,11 +679,13 @@ class WorkflowExecutor:
 
     def _rollout_stats(self) -> str:
         stats = self.staleness_manager.get_stats()
+        req_stats = self.staleness_manager.get_request_length_stats()
         return (
             f"enqueued: {stats.enqueued}, "
             f"running: {stats.running}, "
             f"accepted: {stats.accepted}, "
-            f"rejected: {stats.rejected}."
+            f"rejected: {stats.rejected}, "
+            f"req_len(avg/std/top25): {req_stats['avg']:.1f}/{req_stats['std']:.1f}/{req_stats['top25_mean']:.1f}."
         )
 
     def _create_workflow_task(

@@ -185,10 +185,17 @@ class RLVRWorkflow(RolloutWorkflow):
         if should_simulate_response:
             for i, (resp, expected_len) in enumerate(zip(resps, expected_lengths)):
                 if expected_len is not None and len(resp.output_tokens) != expected_len:
-                    logger.warning(
+                    msg = (
                         f"Sample {i}: Expected {expected_len} tokens, got {len(resp.output_tokens)} tokens. "
-                        f"Stop reason: {resp.stop_reason}"
+                        f"Stop reason: {resp.stop_reason}. "
+                        f"Input len: {len(resp.input_tokens)}, Output len: {len(resp.output_tokens)}, Total: {len(resp.input_tokens) + len(resp.output_tokens)}"
                     )
+                    if resp.stop_reason == "length":
+                        # If the stop reason is length but we got fewer tokens than expected,
+                        # it typically means we hit the model's context window limit.
+                        logger.info(f"{msg} (Likely due to model context window limit)")
+                    else:
+                        logger.warning(msg)
 
         version = engine.get_version()
         prompt_str = self.tokenizer.decode(input_ids)

@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 def _load_deepscaler_simulation_split(path: str, split: Optional[str]):
     target_split = split or "train"
 
-    # hardcode path to be agentica-org/DeepScaleR-Preview-Dataset for tests
-    path = "agentica-org/DeepScaleR-Preview-Dataset"
+    # hardcode path to be Yuxuan13/deepscaler_with_responses_8k_demo for tests
+    path = "Yuxuan13/deepscaler_with_responses_8k_demo"
     try:
         return load_dataset(path=path, split=target_split)
     except ValueError:
@@ -74,26 +74,19 @@ def get_deepscaler_simulation_rl_dataset(
         )
         result["query_id"] = query_id
 
-        # raw_max_new_token_list = sample.get("max_new_token_list")
-        # if isinstance(raw_max_new_token_list, (list, tuple)):
-        #     result["max_new_token_list"] = [int(v) for v in raw_max_new_token_list]
-        # elif raw_max_new_token_list is not None:
-        #     result["max_new_token_list"] = [int(raw_max_new_token_list)]
-        # else:
-        #     # default to a fixed window when metadata is missing
-        #     result["max_new_token_list"] = [3072]
+        raw_max_new_token_list = sample.get("max_new_token_list")
+        if isinstance(raw_max_new_token_list, str):
+            try:
+                raw_max_new_token_list = json.loads(raw_max_new_token_list)
+            except Exception:
+                pass
 
-        # max_new_token_list = sample.get("max_new_token_list", "[]")
-        # if isinstance(max_new_token_list, str):
-        #     max_new_token_list = json.loads(max_new_token_list)
-
-        # if isinstance(max_new_token_list, list) and len(max_new_token_list) > 0:
-        #     # assert n_samples < len(max_new_token_list), "n_samples must be less than the length of max_new_token_list"
-        #     result["max_new_token_list"] = max_new_token_list
-        # else:
-        #     logger.warning(
-        #         "max_new_token_list is not a valid list, using random values"
-        #     )
+        if isinstance(raw_max_new_token_list, (list, tuple)) and len(raw_max_new_token_list) > 0:
+            result["max_new_token_list"] = [int(v) for v in raw_max_new_token_list]
+        else:
+            logger.warning(
+                "max_new_token_list is not a valid list, using random values"
+            )
             # hardcode max_new_token_list to be 10 for tests
             # test sharp distirbution:
             # mean: 3072, std: 1024, 512, 256, max_val: 8192
@@ -101,13 +94,13 @@ def get_deepscaler_simulation_rl_dataset(
             # mean: 6144, std: 2048, 512, 256, max_val: 8192
             # test multi-node long context distribution:
             # mean: 12288, std: 2048, max_val: 16384
-        n_samples = 10
-        mean = 6144
-        std = 2048
-        max_val = 8192
-        result["max_new_token_list"] = sample_max_new_tokens(
-            n=n_samples, mean=mean, std=std, max_val=max_val
-        )
+            n_samples = 10
+            mean = 6144
+            std = 2048
+            max_val = 8192
+            result["max_new_token_list"] = sample_max_new_tokens(
+                n=n_samples, mean=mean, std=std, max_val=max_val
+            )
 
         return result
 

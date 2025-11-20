@@ -51,6 +51,10 @@ class VLLMBackend:
             "logprobs": 0,
             "stream": False,
         }
+        # DEBUG: Log payload to check max_tokens mismatch
+        # import logging
+        # logger = logging.getLogger("vLLMBackend")
+        # logger.info(f"vLLM Payload max_tokens: {payload['max_tokens']}, input_len: {len(req.input_ids)}")
 
         return HttpRequest(endpoint="/v1/completions", payload=payload)
 
