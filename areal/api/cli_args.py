@@ -683,6 +683,8 @@ class vLLMConfig:
         dist_init_addr: str | None = None,
     ):
         args: dict = conf_as_dict(vllm_config)
+        if not vllm_config.enable_prefix_caching:
+            args["no_enable_prefix_caching"] = True
         args = dict(
             # Model and tokenizer
             tokenizer=vllm_config.model,
