@@ -379,12 +379,7 @@ class WorkflowExecutor:
                     try:
                         self.runner.submit(workflow_fn)
 
-                        request_length = 0.0
-                        max_new_token_list = task.data.get("max_new_token_list")
-                        if max_new_token_list is not None and len(max_new_token_list) > 0:
-                            request_length = float(sum(max_new_token_list) / len(max_new_token_list))
-
-                        self.staleness_manager.on_rollout_submitted(request_length=request_length)
+                        self.staleness_manager.on_rollout_submitted()
                         if self.config.enable_rollout_tracing:
                             self.logger.info(f"Submit rollout. {self._rollout_stats()}")
                     except TaskQueueFullError:
@@ -677,16 +672,17 @@ class WorkflowExecutor:
             f"Expected callable or string module path."
         )
 
-    def _rollout_stats(self) -> str:
+    def _rollout_stats(self, current_req_len: float | None = None) -> str:
         stats = self.staleness_manager.get_stats()
-        req_stats = self.staleness_manager.get_request_length_stats()
-        return (
+        msg = (
             f"enqueued: {stats.enqueued}, "
             f"running: {stats.running}, "
             f"accepted: {stats.accepted}, "
-            f"rejected: {stats.rejected}, "
-            f"req_len(avg/std/top25): {req_stats['avg']:.1f}/{req_stats['std']:.1f}/{req_stats['top25_mean']:.1f}."
+            f"rejected: {stats.rejected}"
         )
+        if current_req_len is not None:
+            msg += f", req_len: {current_req_len:.1f}"
+        return msg + "."
 
     def _create_workflow_task(
         self, pending_task: _RolloutTaskInput
@@ -765,7 +761,16 @@ class WorkflowExecutor:
                         reason = "rejected"
 
                 if should_accept_traj:
-                    manager.on_rollout_accepted()
+                    req_len = 0.0
+                    if traj is not None:
+                        if "loss_mask" in traj and torch.is_tensor(traj["loss_mask"]):
+                            req_len = (
+                                traj["loss_mask"].sum(dim=1).float().mean().item()
+                            )
+                        elif "input_ids" in traj and torch.is_tensor(traj["input_ids"]):
+                            req_len = float(traj["input_ids"].shape[1])
+
+                    manager.on_rollout_accepted(req_len)
                     trace_session_event(
                         "mark_finalized",
                         task_id=task_id,
@@ -773,7 +778,7 @@ class WorkflowExecutor:
                     )
                     if self.config.enable_rollout_tracing:
                         self.logger.info(
-                            f"Finish and accept rollout. {self._rollout_stats()}",
+                            f"Finish and accept rollout. {self._rollout_stats(req_len)}",
                         )
                     assert traj is not None
                     return _RolloutResult(task_id=task_id, trajectory=traj)

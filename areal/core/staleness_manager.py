@@ -37,7 +37,6 @@ class StalenessManager:
         max_concurrent_rollouts: int,
         consumer_batch_size: int,
         max_staleness: int,
-        tracker_queue_size: int | None = None,
     ):
         """Initialize the staleness manager.
 
@@ -49,9 +48,6 @@ class StalenessManager:
             Expected batch size for consuming rollouts during training
         max_staleness : int
             Maximum allowed offpolicyness (version difference) for rollouts
-        tracker_queue_size : int | None, optional
-            Size of the sliding window for tracking average request length.
-            If None, defaults to max_concurrent_rollouts.
         """
         self.max_concurrent_rollouts = max_concurrent_rollouts
         self.consumer_batch_size = consumer_batch_size
@@ -60,11 +56,7 @@ class StalenessManager:
         # Thread-safe access to rollout statistics
         self.lock = Lock()
         self.rollout_stat = RolloutStat()
-
-        # For tracking average request length
-        if tracker_queue_size is None:
-            tracker_queue_size = max(1, max_concurrent_rollouts)
-        self.request_lengths = deque(maxlen=tracker_queue_size)
+        self.last_accepted_length = 0.0
 
     def get_pending_limit(self) -> int:
         """Get the maximum number of pending rollouts allowed.
@@ -131,59 +123,29 @@ class StalenessManager:
         with self.lock:
             self.rollout_stat.enqueued += 1
 
-    def on_rollout_submitted(self, request_length: float = 0) -> None:
+    def on_rollout_submitted(self) -> None:
         """Callback when a rollout is submitted for execution.
 
         Thread-safe method to decrement enqueued counter and increment running counters.
-
-        Parameters
-        ----------
-        request_length : float, optional
-            Length of the submitted request (e.g. max_new_tokens) for tracking.
-            Default is 0.
         """
         with self.lock:
             self.rollout_stat.enqueued -= 1
             self.rollout_stat.running += 1
-            if request_length > 0:
-                self.request_lengths.append(request_length)
 
-    def get_request_length_stats(self) -> dict[str, float]:
-        """Get statistics of recent request lengths.
-
-        Returns
-        -------
-        dict[str, float]
-            Dictionary containing:
-            - avg: Average request length
-            - std: Standard deviation of request lengths
-            - top25_mean: Mean of the top 25% longest requests
-        """
-        with self.lock:
-            if not self.request_lengths:
-                return {"avg": 0.0, "std": 0.0, "top25_mean": 0.0}
-
-            data = list(self.request_lengths)
-            avg = statistics.mean(data)
-            std = statistics.stdev(data) if len(data) > 1 else 0.0
-
-            # Calculate mean of top 25%
-            data.sort(reverse=True)
-            # Ensure at least 1 item is selected if list is not empty
-            k = max(1, int(len(data) * 0.25))
-            top_k = data[:k]
-            top25_mean = statistics.mean(top_k)
-
-            return {"avg": avg, "std": std, "top25_mean": top25_mean}
-
-    def on_rollout_accepted(self) -> None:
+    def on_rollout_accepted(self, length: float) -> None:
         """Callback when a rollout completes successfully and is accepted.
 
         Thread-safe method to decrement running counter and increment accepted counter.
+
+        Parameters
+        ----------
+        length : float
+            The length of the accepted rollout (e.g. generated tokens).
         """
         with self.lock:
             self.rollout_stat.running -= 1
             self.rollout_stat.accepted += 1
+            self.last_accepted_length = length
 
     def on_rollout_rejected(self) -> None:
         """Callback when a rollout completes but is rejected.
