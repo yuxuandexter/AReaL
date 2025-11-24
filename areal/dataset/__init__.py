@@ -93,7 +93,7 @@ def _get_custom_dataset(
             max_length=max_length,
             **kwargs,
         )
-    elif "deepscaler_simulation" in path.lower() and type == "sft":
+    elif "deepscaler" in path.lower() and type == "sft":
         from .deepscaler_simulation import get_deepscaler_simulation_sft_dataset
 
         return get_deepscaler_simulation_sft_dataset(
@@ -103,7 +103,7 @@ def _get_custom_dataset(
             max_length=max_length,
             **kwargs,
         )
-    elif "deepscaler_simulation" in path.lower() and type == "rl":
+    elif "deepscaler" in path.lower() and type == "rl":
         from .deepscaler_simulation import get_deepscaler_simulation_rl_dataset
 
         return get_deepscaler_simulation_rl_dataset(
@@ -113,26 +113,26 @@ def _get_custom_dataset(
             max_length=max_length,
             **kwargs,
         )
-    elif "deepscaler" in path.lower() and type == "sft":
-        from .deepscaler import get_deepscaler_sft_dataset
+    # elif "deepscaler" in path.lower() and type == "sft":
+    #     from .deepscaler import get_deepscaler_sft_dataset
 
-        return get_deepscaler_sft_dataset(
-            path=path,
-            split=split,
-            tokenizer=tokenizer,
-            max_length=max_length,
-            **kwargs,
-        )
-    elif "deepscaler" in path.lower() and type == "rl":
-        from .deepscaler import get_deepscaler_rl_dataset
+    #     return get_deepscaler_sft_dataset(
+    #         path=path,
+    #         split=split,
+    #         tokenizer=tokenizer,
+    #         max_length=max_length,
+    #         **kwargs,
+    #     )
+    # elif "deepscaler" in path.lower() and type == "rl":
+    #     from .deepscaler import get_deepscaler_rl_dataset
 
-        return get_deepscaler_rl_dataset(
-            path=path,
-            split=split,
-            tokenizer=tokenizer,
-            max_length=max_length,
-            **kwargs,
-        )
+    #     return get_deepscaler_rl_dataset(
+    #         path=path,
+    #         split=split,
+    #         tokenizer=tokenizer,
+    #         max_length=max_length,
+    #         **kwargs,
+    #     )
     elif "hh-rlhf" in path and type == "rw":
         from .hhrlhf import get_hhrlhf_rw_dataset
 

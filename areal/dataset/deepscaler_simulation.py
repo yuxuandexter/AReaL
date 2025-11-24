@@ -15,7 +15,12 @@ def _load_deepscaler_simulation_split(path: str, split: Optional[str]):
     target_split = split or "train"
 
     # hardcode path to be Yuxuan13/deepscaler_with_responses_8k_demo for tests
-    path = "Yuxuan13/deepscaler_with_responses_8k_demo"
+
+    if "deepscaler_simulation" in path:
+        path = path.replace("deepscaler_simulation", "Yuxuan13/deepscaler_with_responses_8k_demo")
+    else:
+        path = path
+        
     try:
         return load_dataset(path=path, split=target_split)
     except ValueError:
