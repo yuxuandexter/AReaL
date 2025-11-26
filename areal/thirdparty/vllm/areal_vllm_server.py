@@ -1,3 +1,4 @@
+import os
 import asyncio
 import logging
 from http import HTTPStatus
@@ -258,6 +259,17 @@ if __name__ == "__main__":
     )
     parser = make_arg_parser(parser)
     args = parser.parse_args()
+
+    assert args.host is not None
+    assert args.port is not None
+    os.environ["VLLM_OPENAI_SERVER_ENDPOINT"] = f"{args.host}:{args.port}"
+
+    from vllm.my_logger import get_logger
+
+    get_logger().info(
+        f"VLLM_OPENAI_SERVER_ENDPOINT: {os.environ['VLLM_OPENAI_SERVER_ENDPOINT']}"
+    )
+
     validate_parsed_serve_args(args)
 
     uvloop.run(run_server(args))

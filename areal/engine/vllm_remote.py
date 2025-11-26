@@ -156,6 +156,13 @@ class VLLMBackend:
         cmd = vLLMConfig.build_cmd_from_args(server_args)
 
         _env = os.environ.copy()
+
+        # 将 host 和 port 注入环境变量，以便 vllm 的 my_logger 可以读取
+        host = server_args.get("host")
+        port = server_args.get("port")
+        endpoint = f"{host}:{port}"
+        _env["VLLM_OPENAI_SERVER_ENDPOINT"] = endpoint
+
         # Increase timeout to avoid "No available shared memory broadcast block" during slow ops (compilation/large transfers)
         # Set to 5 minutes (300s). Note: vLLM reads this in ms usually if passed as arg, but env var usage varies.
         # We set both common env vars just in case.
