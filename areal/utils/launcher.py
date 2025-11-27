@@ -138,10 +138,10 @@ def validate_config_for_distributed_launcher(config):
     if allocation_mode.type_ == AllocationType.DECOUPLED_TRAIN:
         assert (
             allocation_mode.gen.world_size + allocation_mode.train.world_size
-            == n_nodes * n_gpus_per_node
+            <= n_nodes * n_gpus_per_node
         ), (
             f"#GPUs required for allocation mode {allocation_mode.gen.world_size + allocation_mode.train.world_size} "
-            f"is not equal to #GPUs in the config {n_nodes * n_gpus_per_node}."
+            f"is greater than #GPUs in the config {n_nodes * n_gpus_per_node}."
         )
     if allocation_mode.gen_backend == "sglang":
         # Launcher should launch SGLang servers according to allocation mode.

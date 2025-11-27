@@ -1,4 +1,5 @@
 import importlib.util
+import math
 import pathlib
 import re
 import sys
@@ -388,7 +389,7 @@ def ray_main(config, run_id: int = 0):
         # Launcher should launch SGLang servers according to allocation mode.
         config.sglang = to_structured_cfg(config.sglang, SGLangConfig)
         n_sglang_servers = allocation_mode.gen.dp_size
-        n_sglang_nodes = max(1, allocation_mode.gen.world_size // n_gpus_per_node)
+        n_sglang_nodes = max(1, math.ceil(allocation_mode.gen.world_size / n_gpus_per_node))
         node_group_size = max(1, allocation_mode.gen_instance_size // n_gpus_per_node)
         n_servers_per_node = max(n_sglang_servers // n_sglang_nodes, 1)
         cross_nodes = allocation_mode.gen_instance_size > n_gpus_per_node
@@ -472,7 +473,7 @@ def ray_main(config, run_id: int = 0):
         # Launcher should launch vLLM servers according to allocation mode.
         vllm_tp_size = allocation_mode.gen.tp_size
         n_vllm_servers = allocation_mode.gen.dp_size
-        n_vllm_nodes = allocation_mode.gen.world_size // n_gpus_per_node
+        n_vllm_nodes = math.ceil(allocation_mode.gen.world_size / n_gpus_per_node)
 
         base_seed = config.vllm.seed
         vllm_args_list = [
