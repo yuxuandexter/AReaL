@@ -534,6 +534,11 @@ class RemoteInfEngine:
             gen_result = self.backend.parse_generation_response(result)
             stop_reason = gen_result.stop_reason
 
+            # Log tokens per decode patch
+            tokens_in_patch = len(gen_result.output_tokens)
+            logger = getattr(self, "logger", logging.getLogger("RemoteInfEngine"))
+            logger.info(f"Decode patch size: {tokens_in_patch} tokens")
+
             # Update accumulated outputs
             accumulated_output_tokens.extend(gen_result.output_tokens)
             accumulated_output_logprobs.extend(gen_result.output_logprobs)
@@ -851,6 +856,26 @@ class RemoteInfEngine:
         """Resume request submission for async rollout."""
         return self.workflow_executor.resume()
 
+    # def recompute_kv_cache(self) -> Future[None]:
+    #     """Recompute KV cache in background."""
+    #     fut = self.executor.submit(
+    #         _recompute_kv_cache_remote,
+    #         self.backend,
+    #         self.addresses,
+    #         self.config.pause_grace_period,
+    #         self.config.request_timeout,
+    #     )
+
+    #     def callback(fut):
+    #         try:
+    #             fut.result()
+    #             self.logger.info("Background KV cache recomputation finished")
+    #         except Exception as e:
+    #             self.logger.error(f"Background KV cache recomputation failed: {e}")
+
+    #     fut.add_done_callback(callback)
+    #     return fut
+
     def launch_server(self, server_args: dict[str, Any]) -> LocalInfServerInfo:
         """Launch a local inference server."""
         server_args["host"] = gethostip()
@@ -1012,3 +1037,39 @@ def _update_weights_from_distributed(
                 await asyncio.gather(*jobs)
 
     return uvloop.run(_fn())
+
+
+# def _recompute_kv_cache_remote(
+#     backend: RemoteInfBackendProtocol,
+#     addresses: list[str],
+#     pause_grace_period: float,
+#     request_timeout: float,
+# ):
+#     """Helper to recompute KV cache in a separate process."""
+#     try:
+#         pause_req = backend.get_pause_request()
+#         for addr in addresses:
+#             requests.post(
+#                 f"http://{addr}{pause_req.endpoint}",
+#                 json=pause_req.payload,
+#                 timeout=request_timeout,
+#             ).raise_for_status()
+#     except NotImplementedError:
+#         pass
+#     except Exception:
+#         pass
+
+#     time.sleep(pause_grace_period)
+
+#     try:
+#         resume_req = backend.get_resume_request()
+#         for addr in addresses:
+#             requests.post(
+#                 f"http://{addr}{resume_req.endpoint}",
+#                 json=resume_req.payload,
+#                 timeout=request_timeout,
+#             ).raise_for_status()
+#     except NotImplementedError:
+#         pass
+#     except Exception:
+#         pass

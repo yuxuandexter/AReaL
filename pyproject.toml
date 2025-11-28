@@ -159,7 +159,7 @@ chat = [
 ]
 
 inference = [
-    "sglang[all]==0.5.2",
+    "sglang[all]==0.5.5.post1",
 ]
 
 all = [
@@ -185,7 +185,7 @@ include = ["areal*"]
 exclude = ["tests*", "realhf*", "docs*", "examples*", "evaluation*", "benchmark*"]
 
 [tool.uv]
-exclude-dependencies = ["flash-attn"]
+# exclude-dependencies = ["flash-attn"]
 override-dependencies=[
     "outlines-core==0.1.26",
 ]

@@ -1401,6 +1401,20 @@ class GRPOConfig(BaseExperimentConfig):
             "help": "Enable simulation mode for benchmarking/debugging purposes."
         },
     )
+    profiling_mode: str | None = field(
+        default=None,
+        metadata={
+            "help": "Profiling mode: 'rollout' or 'training'. Default is None.",
+            "choices": ["rollout", "training", None],
+        },
+    )
+    rollout_train_window: int | None = field(
+        default=None,
+        metadata={
+            "help": "Number of steps to run rollout profiling before switching to training profiling. "
+            "If set, overrides profiling_mode for the first N steps."
+        },
+    )
     reward_timeout_seconds: float = field(
         default=0.5,
         metadata={

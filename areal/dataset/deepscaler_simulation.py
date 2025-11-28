@@ -6,6 +6,7 @@ from datasets import load_dataset
 import json
 import random
 
+import torch
 from areal.utils import logging
 
 logger = logging.getLogger(__name__)
@@ -17,7 +18,7 @@ def _load_deepscaler_simulation_split(path: str, split: Optional[str]):
     # hardcode path to be Yuxuan13/deepscaler_with_responses_8k_demo for tests
 
     if "deepscaler_simulation" in path:
-        path = path.replace("deepscaler_simulation", "Yuxuan13/deepscaler_with_responses_8k_demo")
+        path = "Yuxuan13/deepscaler_with_responses_8k_demo"
     else:
         path = path
         
@@ -88,6 +89,7 @@ def get_deepscaler_simulation_rl_dataset(
 
         if isinstance(raw_max_new_token_list, (list, tuple)) and len(raw_max_new_token_list) > 0:
             result["max_new_token_list"] = [int(v) for v in raw_max_new_token_list]
+            logger.info(f"max_new_token_list: {result['max_new_token_list']}")
         else:
             logger.warning(
                 "max_new_token_list is not a valid list, using random values"
@@ -166,3 +168,79 @@ def get_deepscaler_simulation_sft_dataset(
         dataset = dataset.filter(filter_length)
 
     return dataset
+
+
+def get_simulated_training_batch(
+    batch_size: int,
+    tokenizer,
+    device: torch.device,
+    prompt_len: int = 128,
+    max_new_token_list: Optional[list[int]] = None,
+    pad_token_id: int = 0,
+):
+    """Generates a simulated training batch using torch.
+
+    The batch contains:
+      - input_ids: LongTensor of shape (batch_size, max_seq_len)
+      - attention_mask: BoolTensor of shape (batch_size, max_seq_len)
+      - loss_mask: BoolTensor of shape (batch_size, max_seq_len)
+      - logprobs: FloatTensor of shape (batch_size, max_seq_len)
+      - rewards: FloatTensor of shape (batch_size,)
+      - values: FloatTensor of shape (batch_size, max_seq_len)
+
+    The sequence length for each sample is prompt_len + new_tokens, where new_tokens
+    is sampled from max_new_token_list (or defaults).
+    """
+
+    # Determine lengths for each sample in the batch
+    seq_lengths = []
+    
+    if max_new_token_list is None:
+        # Use default logic if not provided (mean=6144, std=2048, etc.)
+        # Similar to get_deepscaler_simulation_rl_dataset default
+        n_samples = batch_size
+        mean = 6144
+        std = 2048
+        max_val = 8192
+        generated_lengths = sample_max_new_tokens(
+            n=n_samples, mean=mean, std=std, max_val=max_val
+        )
+    else:
+        # Sample from the provided list. If list is smaller than batch_size, resample.
+        generated_lengths = [random.choice(max_new_token_list) for _ in range(batch_size)]
+
+    for gen_len in generated_lengths:
+        total_len = prompt_len + gen_len
+        seq_lengths.append(total_len)
+    
+    max_seq_len = max(seq_lengths)
+
+    # Initialize tensors
+    input_ids = torch.full((batch_size, max_seq_len), pad_token_id, dtype=torch.long, device=device)
+    attention_mask = torch.zeros((batch_size, max_seq_len), dtype=torch.long, device=device) # Usually 1 for valid, 0 for pad
+    loss_mask = torch.zeros((batch_size, max_seq_len), dtype=torch.float, device=device)
+    logprobs = torch.randn((batch_size, max_seq_len), dtype=torch.float, device=device)
+    values = torch.randn((batch_size, max_seq_len), dtype=torch.float, device=device)
+    rewards = torch.randn((batch_size,), dtype=torch.float, device=device)
+
+    vocab_size = getattr(tokenizer, "vocab_size", 32000)
+
+    for i, length in enumerate(seq_lengths):
+        # Fill valid data
+        input_ids[i, :length] = torch.randint(0, vocab_size, (length,), device=device)
+        attention_mask[i, :length] = 1
+        
+        # Loss mask: usually 0 for prompt, 1 for response. 
+        # Here we assume last (length - prompt_len) tokens are response
+        resp_len = length - prompt_len
+        if resp_len > 0:
+            loss_mask[i, prompt_len:length] = 1.0
+    
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "loss_mask": loss_mask,
+        "logprobs": logprobs,
+        "rewards": rewards,
+        "values": values,
+    }

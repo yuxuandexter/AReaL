@@ -672,7 +672,7 @@ class WorkflowExecutor:
             f"Expected callable or string module path."
         )
 
-    def _rollout_stats(self, current_req_len: float | None = None) -> str:
+    def _rollout_stats(self, current_req_len: list[float] | None = None) -> str:
         stats = self.staleness_manager.get_stats()
         msg = (
             f"enqueued: {stats.enqueued}, "
@@ -681,7 +681,7 @@ class WorkflowExecutor:
             f"rejected: {stats.rejected}"
         )
         if current_req_len is not None:
-            msg += f", req_len: {current_req_len:.1f}"
+            msg += f", req_lens: {current_req_len}"
         return msg + "."
 
     def _create_workflow_task(
@@ -761,14 +761,16 @@ class WorkflowExecutor:
                         reason = "rejected"
 
                 if should_accept_traj:
-                    req_len = 0.0
+                    req_len = []
+                    max_len = 0
                     if traj is not None:
-                        if "loss_mask" in traj and torch.is_tensor(traj["loss_mask"]):
+                        if "attention_mask" in traj and torch.is_tensor(traj["attention_mask"]):
+                            # Efficiently calculate non-padding lengths
+                            # attention_mask is 1 for valid tokens, 0 for padding
                             req_len = (
-                                traj["loss_mask"].sum(dim=1).float().mean().item()
+                                traj["attention_mask"].sum(dim=1).float().tolist()
                             )
-                        elif "input_ids" in traj and torch.is_tensor(traj["input_ids"]):
-                            req_len = float(traj["input_ids"].shape[1])
+                            max_len = traj["attention_mask"].shape[1]
 
                     manager.on_rollout_accepted(req_len)
                     trace_session_event(
@@ -777,8 +779,17 @@ class WorkflowExecutor:
                         status="accepted",
                     )
                     if self.config.enable_rollout_tracing:
+                        # Log detailed length stats to verify padding is excluded
+                        mask_shape = (
+                            traj["attention_mask"].shape
+                            if traj is not None
+                            and "attention_mask" in traj
+                            and torch.is_tensor(traj["attention_mask"])
+                            else "N/A"
+                        )
                         self.logger.info(
-                            f"Finish and accept rollout. {self._rollout_stats(req_len)}",
+                            f"Finish and accept rollout. {self._rollout_stats(req_len)} "
+                            f"(Batch Max Len: {max_len}, Mask Shape: {mask_shape})"
                         )
                     assert traj is not None
                     return _RolloutResult(task_id=task_id, trajectory=traj)

@@ -302,6 +302,9 @@ class RemoteSGLangEngine(InferenceEngine):
     def continue_generation(self):
         return self._engine.continue_generation()
 
+    def recompute_kv_cache(self):
+        return self._engine.recompute_kv_cache()
+
     def launch_server(self, server_args: dict[str, Any]) -> LocalInfServerInfo:
         return self._engine.launch_server(server_args)
 
