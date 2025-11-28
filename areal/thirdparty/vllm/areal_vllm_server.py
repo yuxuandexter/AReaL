@@ -276,9 +276,7 @@ if __name__ == "__main__":
     assert args.port is not None
     os.environ["VLLM_OPENAI_SERVER_ENDPOINT"] = f"{args.host}:{args.port}"
 
-    from vllm.my_logger import get_logger
-
-    get_logger().info(
+    logger.info(
         f"VLLM_OPENAI_SERVER_ENDPOINT: {os.environ['VLLM_OPENAI_SERVER_ENDPOINT']}"
     )
 
