@@ -56,7 +56,7 @@ class StalenessManager:
         # Thread-safe access to rollout statistics
         self.lock = Lock()
         self.rollout_stat = RolloutStat()
-        self.last_accepted_length = 0.0
+        self.last_accepted_length: float | list[float] = 0.0
 
     def get_pending_limit(self) -> int:
         """Get the maximum number of pending rollouts allowed.
@@ -132,15 +132,16 @@ class StalenessManager:
             self.rollout_stat.enqueued -= 1
             self.rollout_stat.running += 1
 
-    def on_rollout_accepted(self, length: float) -> None:
+    def on_rollout_accepted(self, length: float | list[float]) -> None:
         """Callback when a rollout completes successfully and is accepted.
 
         Thread-safe method to decrement running counter and increment accepted counter.
 
         Parameters
         ----------
-        length : float
+        length : float | list[float]
             The length of the accepted rollout (e.g. generated tokens).
+            Can be a single float or a list of floats for batched rollouts.
         """
         with self.lock:
             self.rollout_stat.running -= 1

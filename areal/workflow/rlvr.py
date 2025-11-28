@@ -111,6 +111,7 @@ class RLVRWorkflow(RolloutWorkflow):
         req: ModelRequest,
         prompt_str: str,
         task_data: dict[str, Any],
+        resp: ModelResponse | None = None,
     ) -> tuple[ModelResponse, float, str]:
         """Generate one sample and compute its reward.
 
@@ -123,8 +124,9 @@ class RLVRWorkflow(RolloutWorkflow):
         tuple[ModelResponse, float, str]
             Model response, reward value, and completion string.
         """
-        async with atrace_session_phase("generate"):
-            resp = await engine.agenerate(req)
+        if resp is None:
+            async with atrace_session_phase("generate"):
+                resp = await engine.agenerate(req)
 
         reward, completions_str = await self._compute_rewards(
             resp, prompt_str, task_data
@@ -170,15 +172,19 @@ class RLVRWorkflow(RolloutWorkflow):
                 )
                 requests.append(req)
                 expected_lengths.append(per_sample_max)
+            
+            logger.info(f"Simulated response expected lengths: {expected_lengths}")
         else:
-            req = ModelRequest(
-                rid=uuid.uuid4().hex,
-                input_ids=input_ids,
-                gconfig=self.gconfig.new(n_samples=1),
-                tokenizer=self.tokenizer,
-            )
-            requests.append(req)
-            expected_lengths.append(None)
+            for _ in range(n_samples):
+                req = ModelRequest(
+                    rid=uuid.uuid4().hex,
+                    input_ids=input_ids,
+                    gconfig=self.gconfig.new(n_samples=1),
+                    tokenizer=self.tokenizer,
+                )
+                requests.append(req)
+                expected_lengths.append(None)
+        
         resps = await asyncio.gather(*[engine.agenerate(req) for req in requests])
 
         # Validate output lengths if simulation was requested
@@ -204,8 +210,8 @@ class RLVRWorkflow(RolloutWorkflow):
         # Generate responses and collect rewards
         sample_results = await asyncio.gather(
             *[
-                self._collect_samples(engine, req, prompt_str, data)
-                for _ in range(n_samples)
+                self._collect_samples(engine, req, prompt_str, data, resp=resp)
+                for req, resp in zip(requests, resps)
             ]
         )
         if sample_results:

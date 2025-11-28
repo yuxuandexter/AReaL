@@ -52,9 +52,9 @@ class VLLMBackend:
             "stream": False,
         }
         # DEBUG: Log payload to check max_tokens mismatch
-        # import logging
-        # logger = logging.getLogger("vLLMBackend")
-        # logger.info(f"vLLM Payload max_tokens: {payload['max_tokens']}, input_len: {len(req.input_ids)}")
+        import logging
+        logger = logging.getLogger("vLLMBackend")
+        logger.info(f"vLLM Payload max_tokens: {payload['max_tokens']}, input_len: {len(req.input_ids)}, ignore_eos: {payload['ignore_eos']}")
 
         return HttpRequest(endpoint="/v1/completions", payload=payload)
 
@@ -67,6 +67,12 @@ class VLLMBackend:
 
         # Parse tokens from "token:123" format
         output_tokens = meta_info["logprobs"]["tokens"]
+        
+        # DEBUG log output length
+        # import logging
+        # logger = logging.getLogger("vLLMBackend") 
+        # logger.info(f"vLLM Response stop_reason: {stop_reason}, output_len: {len(output_tokens)}")
+
         if stop_reason == "abort" and len(output_tokens) == 0:
             return HttpGenerationResult(
                 output_tokens=[],
@@ -297,6 +303,9 @@ class RemotevLLMEngine(InferenceEngine):
 
     def continue_generation(self):
         return self._engine.continue_generation()
+
+    def recompute_kv_cache(self):
+        return self._engine.recompute_kv_cache()
 
     def launch_server(self, server_args: dict[str, Any]) -> LocalInfServerInfo:
         return self._engine.launch_server(server_args)

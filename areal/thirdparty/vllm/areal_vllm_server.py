@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import time
 from http import HTTPStatus
 
 import uvloop
@@ -186,18 +187,25 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 # engine core related hook functions
 def abort_all_reqs(self):
     """Abort all running and waiting requests and clean up resources."""
+    t0 = time.perf_counter()
+    logger.info(f"[{time.perf_counter() - t0:.4f}s] Start abort_all_reqs")
+    
     scheduler = self.scheduler
     abort_lists = list(scheduler.running) + list(scheduler.waiting)
+    logger.info(f"[{time.perf_counter() - t0:.4f}s] Aborting {len(abort_lists)} requests")
 
     if not abort_lists:
         # No requests to abort
+        logger.info(f"[{time.perf_counter() - t0:.4f}s] Resetting prefix cache (empty list)")
         success = scheduler.reset_prefix_cache()
         if not success:
             raise RuntimeError(
                 f"Prefix cache must be reset to prevent kv cache pollution! Reset: {success}"
             )
+        logger.info(f"[{time.perf_counter() - t0:.4f}s] Done (empty list)")
         return
 
+    logger.info(f"[{time.perf_counter() - t0:.4f}s] Building client outputs")
     client_outputs = {}
     for req in abort_lists:
         engine_output = EngineCoreOutput(
@@ -213,17 +221,21 @@ def abort_all_reqs(self):
         client_outputs[req.client_index].append(engine_output)
 
     request_ids = [req.request_id for req in abort_lists]
+    logger.info(f"[{time.perf_counter() - t0:.4f}s] Finishing requests in scheduler")
     scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
+    logger.info(f"[{time.perf_counter() - t0:.4f}s] Putting outputs to queue")
     for client_index, outputs in client_outputs.items():
         engine_core_outputs = EngineCoreOutputs(outputs=outputs)
         self.output_queue.put_nowait((client_index, engine_core_outputs))
 
+    logger.info(f"[{time.perf_counter() - t0:.4f}s] Resetting prefix cache (final)")
     success = scheduler.reset_prefix_cache()
     if not success:
         raise RuntimeError(
             f"Prefix cache must be reset to prevent kv cache pollution! Reset: {success}"
         )
+    logger.info(f"[{time.perf_counter() - t0:.4f}s] Done")
 
 
 def areal_injected_update_weight(self, path):
