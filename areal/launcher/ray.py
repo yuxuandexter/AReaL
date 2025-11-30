@@ -11,7 +11,10 @@ import ray
 import ray.exceptions
 from ray.runtime_env import RuntimeEnv
 from ray.util.placement_group import PlacementGroup
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray.util.scheduling_strategies import (
+    NodeAffinitySchedulingStrategy,
+    PlacementGroupSchedulingStrategy,
+)
 
 import areal.utils.logging as logging
 from areal.api.alloc_mode import AllocationMode, AllocationType
@@ -592,8 +595,13 @@ def ray_main(config, run_id: int = 0):
         # Note: For trainer processes, we use force=True because the trainer doesn't
         # handle KeyboardInterrupt properly when force=False.
         launcher.stop_all(force=True, pattern="trainer")
-        recover_states = [JobState.FAILED]
+        
         if isinstance(e, JobException):
+            if e.reason == JobState.COMPLETED:
+                logger.info("Job completed successfully.")
+                return
+
+            recover_states = [JobState.FAILED]
             recover_this = (
                 e.reason in recover_states
                 and run_id < config.recover.retries

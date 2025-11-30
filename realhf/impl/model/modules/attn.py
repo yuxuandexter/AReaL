@@ -194,6 +194,10 @@ class CausalSelfAttentionLayer(nn.Module):
             q = self.q_ln(q)
             k = self.k_ln(k)
 
+        # logger.info("Skipping attention calculation, passing query directly.")
+        # hidden_states = q
+
+       
         if self.apply_rotary and (k_cache is None or str(q.device) == "cpu"):
             # otherwise, we input rotary cos/sin directly into flash_attn_with_kvcache
             rotary_cache_len = max_seqlen
@@ -302,6 +306,7 @@ class CausalSelfAttentionLayer(nn.Module):
             raise NotImplementedError(
                 "Don't know which attention implementation to use."
             )
+
         hidden_states = self.c_proj(hidden_states.flatten(start_dim=-2))
         hidden_states = self.resid_dropout(hidden_states)
         return hidden_states, k, v

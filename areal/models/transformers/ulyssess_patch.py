@@ -59,6 +59,8 @@ def _ulysses_flash_attention_forward(
         *args,
         **kwargs,
     )
+    # logger.info("Skipping attention calculation, passing query directly.")
+    # attn_output = query_states
 
     if ulysses_sp_size > 1:
         # (1, total_seqlen, num_heads / sp_size, head_dim)
