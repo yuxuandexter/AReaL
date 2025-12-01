@@ -433,6 +433,12 @@ class TrainEngineConfig:
     grad_reduce_dtype: str = field(
         default="float32", metadata={"help": "Gradient reduction data type."}
     )
+    no_attn: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to skip attention calculation (for profiling purposes)."
+        },
+    )
     optimizer: OptimizerConfig | None = field(
         default=None,
         metadata={"help": "Optimizer configuration. None means no training."},
@@ -1399,6 +1405,12 @@ class GRPOConfig(BaseExperimentConfig):
         default=False,
         metadata={
             "help": "Enable simulation mode for benchmarking/debugging purposes."
+        },
+    )
+    train_only: bool = field(
+        default=False,
+        metadata={
+            "help": "Force training mode only, ignoring rollout/train window."
         },
     )
     profiling_mode: str | None = field(

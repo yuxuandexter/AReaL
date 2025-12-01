@@ -1,4 +1,5 @@
 # Adapted from verl
+# FIXME: This is a temporary fix to enable attention skipping logic for profiling.
 
 import torch
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
@@ -14,6 +15,8 @@ from areal.utils.ulysses import (
 )
 
 logger = logging.getLogger("Ulysses Monkey Patch")
+
+_NO_ATTN_FLAG = False
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -52,15 +55,17 @@ def _ulysses_flash_attention_forward(
         value_states = gather_seq_scatter_heads(value_states, seq_dim=1, head_dim=2)
 
     # (1, total_seqlen, num_heads / sp_size, head_dim)
-    attn_output = _flash_attention_forward(
-        query_states,
-        key_states,
-        value_states,
-        *args,
-        **kwargs,
-    )
-    # logger.info("Skipping attention calculation, passing query directly.")
-    # attn_output = query_states
+    if _NO_ATTN_FLAG:
+        logger.debug("Skipping attention calculation, passing query directly.")
+        attn_output = query_states
+    else:
+        attn_output = _flash_attention_forward(
+            query_states,
+            key_states,
+            value_states,
+            *args,
+            **kwargs,
+        )
 
     if ulysses_sp_size > 1:
         # (1, total_seqlen, num_heads / sp_size, head_dim)
@@ -149,7 +154,11 @@ def patch_vlm_for_ulysses_input_slicing(model_class: type):
 def apply_monkey_patch(
     model: PreTrainedModel,
     ulysses_sp_size: int = 1,
+    no_attn: bool = False,
 ):
+    global _NO_ATTN_FLAG
+    _NO_ATTN_FLAG = no_attn
+
     try:
         num_attention_heads, num_key_value_heads = (
             model.config.num_attention_heads,
@@ -199,7 +208,8 @@ def apply_monkey_patch(
         },
     }
 
-    if ulysses_sp_size <= 1:
+    # NOTE: Allow patching even if ulysses_sp_size <= 1 to enable attention skipping logic for profiling
+    if ulysses_sp_size <= 1 and not no_attn:
         return
 
     if model.config.model_type in vl_model_mappings:

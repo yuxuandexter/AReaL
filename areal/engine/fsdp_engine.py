@@ -162,6 +162,7 @@ class FSDPEngine(BaseHFEngine):
         apply_monkey_patch(
             model=self.model,
             ulysses_sp_size=self.parallel_helper.sp_size,
+            no_attn=self.config.no_attn,
         )
 
         if self.config.use_lora:
