@@ -18,6 +18,9 @@ VALID_DATASETS = [
     "torl_data",
     "deepscaler",
     "deepscaler_simulation",
+    "polaris_simulation",
+    "omni_simulation",
+    "workbook_simulation",
 ]
 
 logger = logging.getLogger("Dataset")
@@ -90,6 +93,66 @@ def _get_custom_dataset(
             path=path,
             split=split,
             processor=processor,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "polaris" in path.lower() and type == "sft":
+        from .polaris_simulation import get_polaris_simulation_sft_dataset
+
+        return get_polaris_simulation_sft_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "polaris" in path.lower() and type == "rl":
+        from .polaris_simulation import get_polaris_simulation_rl_dataset
+
+        return get_polaris_simulation_rl_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "omni" in path.lower() and type == "sft":
+        from .omni_simulation import get_omni_simulation_sft_dataset
+
+        return get_omni_simulation_sft_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif "omni" in path.lower() and type == "rl":
+        from .omni_simulation import get_omni_simulation_rl_dataset
+
+        return get_omni_simulation_rl_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif ("workbook" in path.lower() or "lean" in path.lower()) and type == "sft":
+        from .workbook_simulation import get_workbook_simulation_sft_dataset
+
+        return get_workbook_simulation_sft_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
+            max_length=max_length,
+            **kwargs,
+        )
+    elif ("workbook" in path.lower() or "lean" in path.lower()) and type == "rl":
+        from .workbook_simulation import get_workbook_simulation_rl_dataset
+
+        return get_workbook_simulation_rl_dataset(
+            path=path,
+            split=split,
+            tokenizer=tokenizer,
             max_length=max_length,
             **kwargs,
         )
