@@ -155,6 +155,17 @@ async def continue_generation(raw_request: Request):
     return to_json_response(True, "Generation continued")
 
 
+@router.get("/areal_queue_stats")
+async def queue_stats(raw_request: Request):
+    """Debug endpoint: returns running/waiting request counts for load imbalance analysis."""
+    llm = raw_request.app.state.engine_client
+    try:
+        stats = await llm.engine_core.call_utility_async("get_queue_stats")
+    except Exception as e:
+        stats = {"running": -1, "waiting": -1, "timestamp": time.time(), "error": str(e)}
+    return JSONResponse(content=stats)
+
+
 async def _wait_if_paused():
     """Wait if generation is paused."""
     if not _generation_run_event.is_set():
@@ -176,7 +187,10 @@ async def _wait_if_paused():
 async def create_completion(request: CompletionRequest, raw_request: Request):
     """Wrapped completions endpoint that respects pause state."""
 
+    _was_waiting = not _generation_run_event.is_set()
     await _wait_if_paused()
+    if _was_waiting:
+        logger.info(f"[POST_RESUME_ARRIVAL] timestamp={time.time():.6f}")
 
     # Will not use streaming response here.
     response = await original_create_completion(request, raw_request)
@@ -191,8 +205,14 @@ def abort_all_reqs(self):
     logger.info(f"[{time.perf_counter() - t0:.4f}s] Start abort_all_reqs")
     
     scheduler = self.scheduler
+    n_running = len(scheduler.running)
+    n_waiting = len(scheduler.waiting)
     abort_lists = list(scheduler.running) + list(scheduler.waiting)
     logger.info(f"[{time.perf_counter() - t0:.4f}s] Aborting {len(abort_lists)} requests")
+    logger.info(
+        f"[ABORT_COUNT] running={n_running} waiting={n_waiting} "
+        f"total={n_running + n_waiting}"
+    )
 
     if not abort_lists:
         # No requests to abort
@@ -238,6 +258,16 @@ def abort_all_reqs(self):
     logger.info(f"[{time.perf_counter() - t0:.4f}s] Done")
 
 
+def get_queue_stats(self):
+    """Return running/waiting request counts from inside EngineCore."""
+    scheduler = self.scheduler
+    return {
+        "running": len(scheduler.running),
+        "waiting": len(scheduler.waiting),
+        "timestamp": time.time(),
+    }
+
+
 def areal_injected_update_weight(self, path):
     self.abort_all_reqs()
     return self.collective_rpc("update_weights", args=(path,))
@@ -250,6 +280,7 @@ def areal_injected_update_weight_xccl(self):
 
 def hook():
     setattr(EngineCore, "abort_all_reqs", abort_all_reqs)
+    setattr(EngineCore, "get_queue_stats", get_queue_stats)
     setattr(EngineCore, "areal_injected_update_weight", areal_injected_update_weight)
     setattr(
         EngineCore,

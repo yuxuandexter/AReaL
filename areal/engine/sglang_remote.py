@@ -290,6 +290,23 @@ class RemoteSGLangEngine(InferenceEngine):
             dataloader, workflow, workflow_kwargs, should_accept_fn
         )
 
+    def prepare_batch_cooperative(
+        self,
+        dataloader: StatefulDataLoader,
+        workflow: RolloutWorkflow | type[RolloutWorkflow] | str,
+        dp_group=None,
+        sync_interval: float = 2.0,
+        max_local_factor: int = 2,
+        workflow_kwargs: dict[str, Any] | None = None,
+        should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
+    ):
+        """Cooperatively prepare a batch across DP ranks."""
+        return self._engine.prepare_batch_cooperative(
+            dataloader, workflow, dp_group,
+            sync_interval, max_local_factor,
+            workflow_kwargs, should_accept_fn,
+        )
+
     def pause(self):
         return self._engine.pause()
 

@@ -936,7 +936,31 @@ class InferenceEngineConfig:
     )
     schedule_policy: str = field(
         default="round_robin",
-        metadata={"help": "Request scheduling policy", "choices": ["round_robin"]},
+        metadata={
+            "help": "Request scheduling policy. 'round_robin' cycles through servers. "
+                "'least_loaded' routes to the server with the least estimated pending work.",
+            "choices": ["round_robin", "least_loaded"],
+        },
+    )
+    use_cooperative_collection: bool = field(
+        default=False,
+        metadata={
+            "help": "Use cooperative collection across DP heads. "
+                "Fast DPs collect more results to compensate for slow DPs, "
+                "reducing idle time at the all-gather barrier.",
+        },
+    )
+    cooperative_sync_interval: float = field(
+        default=2.0,
+        metadata={
+            "help": "Seconds between all-reduce sync checks during cooperative collection.",
+        },
+    )
+    cooperative_max_local_factor: int = field(
+        default=2,
+        metadata={
+            "help": "Safety cap: each DP collects at most this factor * batch_size results.",
+        },
     )
     setup_timeout: float = field(
         default=120.0,

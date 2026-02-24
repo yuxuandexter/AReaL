@@ -211,6 +211,9 @@ class DistRolloutCoordinator:
         granularity: int = 1,
         workflow_kwargs: dict[str, Any] | None = None,
         should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
+        cooperative: bool = False,
+        cooperative_sync_interval: float = 2.0,
+        cooperative_max_local_factor: int = 2,
     ) -> dict[str, Any]:
         """Prepare async rollout batch with distributed coordination.
 
@@ -234,6 +237,13 @@ class DistRolloutCoordinator:
             Keyword arguments to pass to the workflow constructor
         should_accept_fn : Callable[[Dict[str, Any]], bool] | str, optional
             Filter function for accepting samples based on staleness
+        cooperative : bool, default=False
+            If True, use cooperative collection across DP heads.
+            Fast DPs collect more results to compensate for slow DPs.
+        cooperative_sync_interval : float, default=2.0
+            Seconds between all-reduce sync checks during cooperative collection.
+        cooperative_max_local_factor : int, default=2
+            Safety cap: each DP collects at most batch_size * this factor results.
 
         Returns
         -------
@@ -248,12 +258,23 @@ class DistRolloutCoordinator:
 
         batch = None
         if self.train_engine.is_data_parallel_head():
-            batch = self.rollout_engine.prepare_batch(
-                dataloader,
-                workflow=workflow,
-                workflow_kwargs=workflow_kwargs,
-                should_accept_fn=should_accept_fn,
-            )
+            if cooperative:
+                batch = self.rollout_engine.prepare_batch_cooperative(
+                    dataloader,
+                    workflow=workflow,
+                    dp_group=self.train_engine.data_parallel_group,
+                    sync_interval=cooperative_sync_interval,
+                    max_local_factor=cooperative_max_local_factor,
+                    workflow_kwargs=workflow_kwargs,
+                    should_accept_fn=should_accept_fn,
+                )
+            else:
+                batch = self.rollout_engine.prepare_batch(
+                    dataloader,
+                    workflow=workflow,
+                    workflow_kwargs=workflow_kwargs,
+                    should_accept_fn=should_accept_fn,
+                )
             batch = tensor_container_to(batch, current_platform.current_device())
 
         return self._broadcast_and_redistribute_batch(batch, granularity=granularity)

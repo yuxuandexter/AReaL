@@ -919,6 +919,113 @@ class WorkflowExecutor:
         trajectories = [r.data.trajectory for r in results if r.data is not None]
         return concat_padded_tensors(trajectories)
 
+    def wait_cooperative(
+        self,
+        local_target: int,
+        dp_group: dist.ProcessGroup,
+        global_target: int,
+        max_local: int,
+        sync_interval: float = 2.0,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Cooperatively wait across DP ranks until global_target results collected.
+
+        Instead of each DP head blocking until it has exactly `local_target`
+        results, all DP heads periodically all-reduce their local counts.
+        When the global total reaches `global_target`, all ranks proceed.
+        Fast DPs collect more than `local_target`; slow DPs collect fewer.
+
+        Parameters
+        ----------
+        local_target : int
+            The nominal per-DP batch size (used for logging, not enforced).
+        dp_group : dist.ProcessGroup
+            The data-parallel process group for all-reduce communication.
+        global_target : int
+            Total results needed across all DP ranks (= local_target * dp_size).
+        max_local : int
+            Safety cap: this rank collects at most this many results.
+        sync_interval : float
+            Seconds between all-reduce sync checks. Default 2.0.
+        timeout : float | None
+            Maximum wait time in seconds. Default: 7 days.
+
+        Returns
+        -------
+        dict[str, Any]
+            Concatenated batch tensors from this rank's collected results.
+        """
+        from areal.platforms import current_platform
+
+        start = time.perf_counter()
+        timeout = timeout or float(7 * 24 * 3600)
+        device = current_platform.current_device()
+
+        local_count_t = torch.zeros(1, dtype=torch.int64, device=device)
+        global_count_t = torch.zeros(1, dtype=torch.int64, device=device)
+
+        # Phase 1: Cooperative polling until global target met
+        while time.perf_counter() - start < timeout:
+            self._check_thread_exception()
+            local_ready = min(len(self._pending_results), max_local)
+
+            local_count_t.fill_(local_ready)
+            global_count_t.copy_(local_count_t)
+            dist.all_reduce(global_count_t, op=dist.ReduceOp.SUM, group=dp_group)
+
+            global_count = global_count_t.item()
+            if global_count >= global_target:
+                if self.logger:
+                    self.logger.info(
+                        f"[COOP_COLLECT] Global target met: {global_count}/{global_target}, "
+                        f"local={local_ready}/{local_target}"
+                    )
+                break
+
+            elapsed = time.perf_counter() - start
+            remaining = timeout - elapsed
+            time.sleep(min(sync_interval, max(0.1, remaining)))
+
+        # Phase 2: Agree on exact per-rank drain counts via all-gather
+        local_available = min(len(self._pending_results), max_local)
+        local_count_t.fill_(local_available)
+
+        dp_size = dist.get_world_size(dp_group)
+        all_counts = [
+            torch.zeros(1, dtype=torch.int64, device=device)
+            for _ in range(dp_size)
+        ]
+        dist.all_gather(all_counts, local_count_t, group=dp_group)
+        counts = [int(c.item()) for c in all_counts]
+
+        total = sum(counts)
+        if total < global_target:
+            raise TimeoutError(
+                f"Cooperative wait timed out: collected {total} < {global_target} "
+                f"(per-rank: {counts})"
+            )
+
+        # Trim excess from ranks with most results to hit exact global_target
+        excess = total - global_target
+        while excess > 0:
+            max_idx = max(range(len(counts)), key=lambda i: counts[i])
+            trim = min(excess, counts[max_idx] - 1) if counts[max_idx] > 1 else 1
+            trim = max(trim, 1)
+            counts[max_idx] -= trim
+            excess -= trim
+
+        my_rank = dist.get_rank(dp_group)
+        my_count = counts[my_rank]
+
+        if self.logger:
+            self.logger.info(
+                f"[COOP_COLLECT] Draining {my_count} results "
+                f"(rank={my_rank}, all_counts={counts}, target={global_target})"
+            )
+
+        # Drain exactly my_count results using existing wait() logic
+        return self.wait(count=my_count, timeout=30.0)
+
     @trace_perf("workflow_executor.rollout_batch", category="scheduler")
     def rollout_batch(
         self,
@@ -947,6 +1054,42 @@ class WorkflowExecutor:
             )
         return self.wait(count=len(data))
 
+    def _try_submit_batch(
+        self,
+        dataloader: StatefulDataLoader,
+        workflow: RolloutWorkflow | type[RolloutWorkflow] | str,
+        workflow_kwargs: dict[str, Any] | None = None,
+        should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
+    ) -> bool:
+        """Try to submit one batch from dataloader if capacity allows.
+
+        Returns True if a batch was submitted, False otherwise.
+        """
+        manager = self.staleness_manager
+        if not hasattr(self, "data_generator"):
+            self.data_generator = cycle_dataloader(dataloader)
+
+        if (
+            len(self._pending_inputs) < manager.get_pending_limit()
+            and self.runner.get_input_queue_size() + dataloader.batch_size
+            < self.runner.max_queue_size
+        ):
+            data = next(self.data_generator)
+            perf_tracer.instant(
+                "workflow_executor.prepare_batch",
+                category="scheduler",
+                args={"data": len(data)},
+            )
+            for item in data:
+                self.submit(
+                    item,
+                    workflow=workflow,
+                    should_accept_fn=should_accept_fn,
+                    workflow_kwargs=workflow_kwargs,
+                )
+            return True
+        return False
+
     @trace_perf("workflow_executor.prepare_batch", category="scheduler")
     def prepare_batch(
         self,
@@ -962,32 +1105,14 @@ class WorkflowExecutor:
 
         See :meth:`~areal.api.engine_api.InferenceEngine.prepare_batch` for parameters.
         """
-        manager = self.staleness_manager
-        if not hasattr(self, "data_generator"):
-            self.data_generator = cycle_dataloader(dataloader)
         assert dataloader.batch_size is not None
         cnt = 0
         results = []
         while True:
             # Submit at least two batches to allow maximum overlap
-            if (
-                len(self._pending_inputs) < manager.get_pending_limit()
-                and self.runner.get_input_queue_size() + dataloader.batch_size
-                < self.runner.max_queue_size
-            ):
-                data = next(self.data_generator)
-                perf_tracer.instant(
-                    "workflow_executor.prepare_batch",
-                    category="scheduler",
-                    args={"data": len(data)},
-                )
-                for item in data:
-                    self.submit(
-                        item,
-                        workflow=workflow,
-                        should_accept_fn=should_accept_fn,
-                        workflow_kwargs=workflow_kwargs,
-                    )
+            self._try_submit_batch(
+                dataloader, workflow, workflow_kwargs, should_accept_fn
+            )
             try:
                 res = self.wait(count=1, timeout=1)
                 if not res:
@@ -999,6 +1124,82 @@ class WorkflowExecutor:
             except (TimeoutError, queue.Full):
                 pass
         return concat_padded_tensors(results)
+
+    @trace_perf("workflow_executor.prepare_batch_cooperative", category="scheduler")
+    def prepare_batch_cooperative(
+        self,
+        dataloader: StatefulDataLoader,
+        workflow: RolloutWorkflow | type[RolloutWorkflow] | str,
+        dp_group: dist.ProcessGroup,
+        sync_interval: float = 2.0,
+        max_local_factor: int = 2,
+        workflow_kwargs: dict[str, Any] | None = None,
+        should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
+    ) -> dict[str, Any]:
+        """Prepare a batch cooperatively across DP ranks.
+
+        Like prepare_batch(), but uses cooperative collection: fast DPs collect
+        more results to compensate for slow DPs. Periodically synchronizes
+        global completion counts via all-reduce.
+
+        Parameters
+        ----------
+        dataloader : StatefulDataLoader
+            Data source with batch_size attribute.
+        workflow : RolloutWorkflow | type[RolloutWorkflow] | str
+            Workflow defining rollout logic.
+        dp_group : dist.ProcessGroup
+            Data-parallel process group for synchronization.
+        sync_interval : float
+            Seconds between all-reduce sync checks.
+        max_local_factor : int
+            Safety cap: collect at most batch_size * max_local_factor results.
+        workflow_kwargs, should_accept_fn :
+            Forwarded to submit().
+        """
+        assert dataloader.batch_size is not None
+        local_target = dataloader.batch_size
+        dp_size = dist.get_world_size(dp_group)
+        global_target = local_target * dp_size
+        max_local = local_target * max_local_factor
+
+        # Keep submitting data while cooperatively waiting
+        # The _commit_loop thread handles actual dispatch to runner,
+        # but we need to keep _pending_inputs fed.
+        self._try_submit_batch(
+            dataloader, workflow, workflow_kwargs, should_accept_fn
+        )
+
+        # Start a background submission thread that keeps feeding data
+        # while we do the cooperative wait
+        submit_stop = threading.Event()
+
+        def _keep_submitting():
+            while not submit_stop.is_set():
+                try:
+                    self._try_submit_batch(
+                        dataloader, workflow, workflow_kwargs, should_accept_fn
+                    )
+                except Exception:
+                    break
+                time.sleep(0.5)
+
+        submit_thread = threading.Thread(target=_keep_submitting, daemon=True)
+        submit_thread.start()
+
+        try:
+            result = self.wait_cooperative(
+                local_target=local_target,
+                dp_group=dp_group,
+                global_target=global_target,
+                max_local=max_local,
+                sync_interval=sync_interval,
+            )
+        finally:
+            submit_stop.set()
+            submit_thread.join(timeout=5.0)
+
+        return result
 
     def pause(self):
         """Pause request submission for async rollout.

@@ -38,12 +38,41 @@ from areal.utils.network import find_free_ports, gethostip
 from areal.utils.perf_tracer import trace_perf
 
 from .workflow_executor import WorkflowExecutor
+from dataclasses import dataclass as _dc, field as _field
 
 RID_CACHE_SIZE = 128
 
 # Thread-local storage for aiohttp sessions
 # Each thread gets its own session to ensure thread safety and event loop compatibility
 _session_storage = threading.local()
+
+@_dc
+class _ServerLoadState:
+    """Tracks estimated pending work per server for least-loaded routing.
+
+    Thread-safety: all mutations happen in a single asyncio event loop
+    with no await between read and write in choose_server(). No lock needed.
+    """
+    pending_tokens: dict[str, int] = _field(default_factory=dict)
+    pending_requests: dict[str, int] = _field(default_factory=dict)
+
+    def add(self, addr: str, estimated_tokens: int) -> None:
+        self.pending_tokens[addr] = self.pending_tokens.get(addr, 0) + estimated_tokens
+        self.pending_requests[addr] = self.pending_requests.get(addr, 0) + 1
+
+    def remove(self, addr: str, estimated_tokens: int) -> None:
+        self.pending_tokens[addr] = max(0, self.pending_tokens.get(addr, 0) - estimated_tokens)
+        self.pending_requests[addr] = max(0, self.pending_requests.get(addr, 0) - 1)
+
+    def least_loaded(self, addresses: list[str]) -> str:
+        return min(addresses, key=lambda a: (
+            self.pending_tokens.get(a, 0),
+            self.pending_requests.get(a, 0),
+        ))
+
+    def reset(self) -> None:
+        self.pending_tokens.clear()
+        self.pending_requests.clear()
 
 
 class RemoteInfBackendProtocol(Protocol):
@@ -244,6 +273,17 @@ class RemoteInfEngine:
         self.addresses = []
         self.server_idx = 0
 
+        # Work-aware routing state (used when schedule_policy == "least_loaded")
+        self._server_load = _ServerLoadState()
+        # rid -> charged token estimate (for accurate subtraction on completion/pause)
+        self._rid_charged_tokens: dict[str, int] = {}
+
+
+        # Debug: per-server routing counter for load imbalance analysis
+        self._route_counter: dict[str, int] = {}
+        self._route_total = 0
+        self._pause_cycle = 0
+
         self.distributed_weight_update_initialized = False
         self._version = 0
 
@@ -364,6 +404,11 @@ class RemoteInfEngine:
         for addr_ in self.addresses:
             self._wait_for_server(addr_)
         self.server_idx = random.randint(0, len(self.addresses) - 1)
+
+        for addr in self.addresses:
+            self._server_load.pending_tokens[addr] = 0
+            self._server_load.pending_requests[addr] = 0
+
         self.logger.info("Servers are all ready!")
         self.executor = ProcessPoolExecutor(max_workers=1)
 
@@ -424,7 +469,7 @@ class RemoteInfEngine:
         with self.lock:
             return self._version
 
-    def choose_server(self) -> str:
+    def choose_server(self, estimated_tokens: int = 0) -> str:
         """Choose a server based on the scheduling policy.
 
         Returns
@@ -441,8 +486,13 @@ class RemoteInfEngine:
             server = self.addresses[self.server_idx]
             self.server_idx = (self.server_idx + 1) % len(self.addresses)
             return server
-        raise NotImplementedError("Only round-robin scheduling is implemented.")
-
+        elif self.config.schedule_policy == "least_loaded":
+            server = self._server_load.least_loaded(self.addresses)
+            # Speculative charge BEFORE dispatch (Miles pattern: _use_url increments before HTTP)
+            # Prevents N concurrent coroutines from all picking the same "empty" server
+            self._server_load.add(server, estimated_tokens)
+            return server
+        raise ValueError(f"Unknown schedule_policy: {self.config.schedule_policy!r}")
     async def agenerate(self, req: ModelRequest) -> ModelResponse:
         """Asynchronously generate a response for the given request.
 
@@ -487,18 +537,39 @@ class RemoteInfEngine:
         accumulated_output_tokens = []
         accumulated_output_logprobs = []
         accumulated_versions = []
+        estimated_tokens = req.gconfig.max_new_tokens
 
         # A single "rid" shares the same server to allow KV cache reuse
         if req.rid in self.rid_to_address:
             server_addr = self.rid_to_address[req.rid]
+            if self.config.schedule_policy == "least_loaded":
+                self._server_load.add(server_addr, estimated_tokens)
+                self._rid_charged_tokens[req.rid] = estimated_tokens
+            self.logger.info(f"[ROUTE] rid={req.rid} -> {server_addr} (CACHED)")
         else:
-            server_addr = self.choose_server()
+            server_addr = self.choose_server(estimated_tokens=estimated_tokens)
+            if self.config.schedule_policy == "least_loaded":
+                # choose_server already called add() for least_loaded
+                self._rid_charged_tokens[req.rid] = estimated_tokens
             if len(self.rid_queue) >= RID_CACHE_SIZE:
-                # Remove the oldest entry if cache is full
                 oldest_rid = self.rid_queue.pop(0)
                 self.rid_to_address.pop(oldest_rid, None)
+                self._rid_charged_tokens.pop(oldest_rid, None)
             self.rid_to_address[req.rid] = server_addr
             self.rid_queue.append(req.rid)
+            self.logger.info(
+                f"[ROUTE] rid={req.rid} -> {server_addr} (NEW) est_tokens={estimated_tokens}"
+            )
+
+        # Debug stats with load snapshot
+        self._route_counter[server_addr] = self._route_counter.get(server_addr, 0) + 1
+        self._route_total += 1
+        if self._route_total % 50 == 0:
+            load_snap = {a: self._server_load.pending_tokens.get(a, 0) for a in self.addresses}
+            self.logger.info(
+                f"[ROUTE_STATS] total={self._route_total} "
+                f"per_server={dict(self._route_counter)} load={load_snap}"
+            )
 
         # Get or create thread-local session
         # Thread-local storage ensures each thread has its own session,
@@ -507,17 +578,45 @@ class RemoteInfEngine:
 
         # Deal with rollout interruption
         stop_reason = None
+        _decode_iterations = 0
         while (
             stop_reason not in ["stop", "tool_calls", "length"]
             and len(accumulated_output_tokens) < gconfig.max_new_tokens
         ):
             # Request is interrupted, wait for some time to avoid interfering
             # with update weights requests
+            _was_paused = False
             while self.workflow_executor.is_paused():
+                _was_paused = True
                 await asyncio.sleep(0.5)
+            if _was_paused:
+                # Release old load charge (server aborted this request during pause)
+                if self.config.schedule_policy == "least_loaded":
+                    old_charged = self._rid_charged_tokens.pop(req.rid, 0)
+                    self._server_load.remove(server_addr, old_charged)
+
+                # Re-route: KV cache is wiped, no benefit from stickiness
+                new_estimated = req.gconfig.max_new_tokens  # shrunk by prior iterations
+                server_addr = self.choose_server(estimated_tokens=new_estimated)
+                if self.config.schedule_policy == "least_loaded":
+                    self._rid_charged_tokens[req.rid] = new_estimated
+                self.rid_to_address[req.rid] = server_addr
+
+                self.logger.info(
+                    f"[RESEND] rid={req.rid} server={server_addr} "
+                    f"accumulated={len(accumulated_output_tokens)} tokens, "
+                    f"prompt_len={len(req.input_ids)} "
+                    f"est_remaining={new_estimated} "
+                    f"iteration={_decode_iterations} "
+                    f"pause_cycle={self._pause_cycle}"
+                )
+
+            _decode_iterations += 1
 
             # Build request using backend
             http_req = self.backend.build_generation_request(req, self.lora_initialized)
+
+            _iter_start = time.perf_counter()
 
             # Loop until the generation is complete
             result = await arequest_with_retry(
@@ -539,6 +638,15 @@ class RemoteInfEngine:
             logger = getattr(self, "logger", logging.getLogger("RemoteInfEngine"))
             logger.info(f"Decode patch size: {tokens_in_patch} tokens")
 
+            if _was_paused:
+                self.logger.info(
+                    f"[RESEND_DURATION] rid={req.rid} server={server_addr} "
+                    f"prompt_len={len(req.input_ids)} "
+                    f"new_tokens={tokens_in_patch} "
+                    f"duration={time.perf_counter() - _iter_start:.2f}s "
+                    f"pause_cycle={self._pause_cycle}"
+                )
+
             # Update accumulated outputs
             accumulated_output_tokens.extend(gen_result.output_tokens)
             accumulated_output_logprobs.extend(gen_result.output_logprobs)
@@ -554,6 +662,18 @@ class RemoteInfEngine:
                 len(gen_result.output_tokens),
                 len(req.input_ids),
             )
+        
+        if self.config.schedule_policy == "least_loaded":
+            charged = self._rid_charged_tokens.pop(req.rid, 0)
+            self._server_load.remove(server_addr, charged)
+        
+        # Debug: log generation completion stats
+        gen_duration = time.perf_counter() - start_time
+        self.logger.info(
+            f"[GEN_DONE] rid={req.rid} server={server_addr} "
+            f"tokens={len(accumulated_output_tokens)} duration={gen_duration:.2f}s "
+            f"iterations={_decode_iterations} stop={stop_reason}"
+        )
 
         # Final abort handling
         if stop_reason == "abort":
@@ -814,17 +934,54 @@ class RemoteInfEngine:
             should_accept_fn=should_accept_fn,
         )
 
+    def prepare_batch_cooperative(
+        self,
+        dataloader: StatefulDataLoader,
+        workflow: RolloutWorkflow | type[RolloutWorkflow] | str,
+        dp_group,
+        sync_interval: float = 2.0,
+        max_local_factor: int = 2,
+        workflow_kwargs: dict[str, Any] | None = None,
+        should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
+    ):
+        """Cooperatively prepare a batch across DP ranks.
+
+        Fast DPs collect more results to compensate for slow DPs.
+        See WorkflowExecutor.prepare_batch_cooperative for details.
+        """
+        assert workflow is not None, "Workflow must be specified."
+        return self.workflow_executor.prepare_batch_cooperative(
+            dataloader=dataloader,
+            workflow=workflow,
+            dp_group=dp_group,
+            sync_interval=sync_interval,
+            max_local_factor=max_local_factor,
+            workflow_kwargs=workflow_kwargs,
+            should_accept_fn=should_accept_fn,
+        )
+
     @trace_perf("remote_inf_engine.pause_generation", category="misc")
     def pause_generation(self):
         """Pause request submission for async rollout."""
+        self._pause_cycle += 1
         try:
             pause_req = self.backend.get_pause_request()
-            for addr in self.addresses:
+            t_pause_start = time.perf_counter()
+            for i, addr in enumerate(self.addresses):
+                t0 = time.perf_counter()
                 res = requests.post(
                     f"http://{addr}{pause_req.endpoint}",
                     json=pause_req.payload,
                 )
                 res.raise_for_status()
+                self.logger.info(
+                    f"[PAUSE] server[{i}]={addr} took {time.perf_counter()-t0:.4f}s"
+                )
+            self.logger.info(
+                f"[PAUSE] cycle={self._pause_cycle} "
+                f"total={time.perf_counter()-t_pause_start:.4f}s "
+                f"grace_period={self.config.pause_grace_period}s"
+            )
         except NotImplementedError:
             self.logger.warning("Backend does not support pause operation")
 
@@ -835,16 +992,66 @@ class RemoteInfEngine:
     @trace_perf("remote_inf_engine.continue_generation", category="misc")
     def continue_generation(self):
         """Resume request submission for async rollout."""
-        try:
+        # After pause, KV caches wiped. Clear sticky routing so coroutines
+        # get fresh routing when they wake from asyncio.sleep(0.5).
+        old_count = len(self.rid_to_address)
+        self.rid_to_address.clear()
+        self.rid_queue.clear()
+        if self.config.schedule_policy == "least_loaded":
+            self._server_load.reset()
+            self._rid_charged_tokens.clear()
+        self.logger.info(f"[RESUME] Cleared {old_count} rid routes, reset load state")
+
+        try:            
             resume_req = self.backend.get_resume_request()
-            for addr in self.addresses:
+            t_resume_start = time.perf_counter()
+            for i, addr in enumerate(self.addresses):
+                t0 = time.perf_counter()
                 res = requests.post(
                     f"http://{addr}{resume_req.endpoint}",
                     json=resume_req.payload,
                 )
                 res.raise_for_status()
+                self.logger.info(
+                    f"[RESUME] server[{i}]={addr} took {time.perf_counter()-t0:.4f}s"
+                )
+            self.logger.info(
+                f"[RESUME] cycle={self._pause_cycle} "
+                f"total={time.perf_counter()-t_resume_start:.4f}s"
+            )
         except NotImplementedError:
             self.logger.warning("Backend does not support resume operation")
+
+        # Poll queue stats after resume to capture thundering-herd buildup
+        _poll_logger = self.logger
+        _poll_cycle = self._pause_cycle
+        _poll_addrs = list(self.addresses)
+        def _poll_queue_background():
+            try:
+                for poll_idx in range(15):  # 15 polls x 2s = 30s window
+                    for i, addr in enumerate(_poll_addrs):
+                        try:
+                            resp = requests.get(
+                                f"http://{addr}/areal_queue_stats",
+                                timeout=2.0,
+                            )
+                            if resp.status_code == 200:
+                                stats = resp.json()
+                                _poll_logger.info(
+                                    f"[QUEUE_SNAP] server[{i}]={addr} "
+                                    f"running={stats.get('running', -1)} "
+                                    f"waiting={stats.get('waiting', -1)} "
+                                    f"cycle={_poll_cycle} "
+                                    f"poll={poll_idx}"
+                                )
+                        except Exception:
+                            pass
+                    time.sleep(2.0)
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_poll_queue_background, daemon=True)
+        t.start()
 
     def pause(self):
         """Pause request submission for async rollout.

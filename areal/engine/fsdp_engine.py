@@ -523,12 +523,21 @@ class FSDPEngine(BaseHFEngine):
         should_accept_fn: Callable[[dict[str, Any]], bool] | str | None = None,
     ) -> dict[str, Any]:
         self._check_rollout_engine_connected()
+        inf_config = getattr(self.rollout_engine, "config", None)
+        cooperative = getattr(inf_config, "use_cooperative_collection", False)
         return self.rollout_coordinator.prepare_batch(
             dataloader,
             granularity=granularity,
             workflow=workflow,
             workflow_kwargs=workflow_kwargs,
             should_accept_fn=should_accept_fn,
+            cooperative=cooperative,
+            cooperative_sync_interval=getattr(
+                inf_config, "cooperative_sync_interval", 2.0
+            ),
+            cooperative_max_local_factor=getattr(
+                inf_config, "cooperative_max_local_factor", 2
+            ),
         )
 
     @trace_perf("fsdp_engine.train_batch", category="compute")

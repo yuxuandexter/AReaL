@@ -39,7 +39,9 @@ BASE_ENVIRONS = {
     "VLLM_CACHE_ROOT": VLLM_CACHE_ROOT,
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "PYTHONPATH": PYTHONPATH,
+    "CUDA_HOME": os.environ.get("CUDA_HOME", "/usr/local/cuda"),
 }
+
 NA132_ENVIRONS = {
     "NCCL_SOCKET_IFNAME": "bond0",
     "NCCL_NET_PLUGIN": "",
